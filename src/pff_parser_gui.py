@@ -77,6 +77,7 @@ def run_parser():
     expand = var_expand_modules.get()
     compact = var_compact.get() if mode == "TRACE" else False  # в PERF не используется
     include_model_prompt = var_include_model_prompt.get()
+    highlight_extensions = var_highlight_extensions.get()
 
     try:
         report = process_pff(
@@ -91,6 +92,7 @@ def run_parser():
             no_context=False,
             expand_module_names=expand,
             include_model_prompt=include_model_prompt,
+            highlight_extensions=highlight_extensions,
         )
     except Exception as e:
         messagebox.showerror("Ошибка", str(e))
@@ -129,7 +131,7 @@ def choose_file():
 
 
 def build_ui(root: tk.Tk):
-    global var_file, var_mode, var_entry, var_threshold, var_expand_modules, var_compact, var_include_model_prompt, result_text
+    global var_file, var_mode, var_entry, var_threshold, var_expand_modules, var_highlight_extensions, var_compact, var_include_model_prompt, result_text
     global var_out_path, btn_copy, btn_open, _widgets_for_mode
 
     root.title("Парсер замеров производительности")
@@ -178,12 +180,17 @@ def build_ui(root: tk.Tk):
     var_expand_modules = tk.BooleanVar(value=True)
     check_expand = ttk.Checkbutton(main, text="Разворачивать имена модулей", variable=var_expand_modules)
     check_expand.grid(row=8, column=0, sticky=tk.W, pady=(0, 4))
+    
+    var_highlight_extensions = tk.BooleanVar(value=True)
+    check_highlight_ext = ttk.Checkbutton(main, text="Выделять расширения [Ext:Name]", variable=var_highlight_extensions)
+    check_highlight_ext.grid(row=9, column=0, sticky=tk.W, pady=(0, 4))
+
     var_compact = tk.BooleanVar(value=True)
     check_compact = ttk.Checkbutton(main, text="Умное сжатие", variable=var_compact)
-    check_compact.grid(row=9, column=0, sticky=tk.W, pady=(0, 4))
+    check_compact.grid(row=10, column=0, sticky=tk.W, pady=(0, 4))
     var_include_model_prompt = tk.BooleanVar(value=True)
     check_model_prompt = ttk.Checkbutton(main, text="Включить промпт для модели в заголовок", variable=var_include_model_prompt)
-    check_model_prompt.grid(row=10, column=0, sticky=tk.W, pady=(0, 8))
+    check_model_prompt.grid(row=11, column=0, sticky=tk.W, pady=(0, 8))
 
     _widgets_for_mode = {
         "var_mode": var_mode,
@@ -194,7 +201,7 @@ def build_ui(root: tk.Tk):
 
     # Строка «Результат» + кнопка «Сформировать» справа (кнопка по умолчанию — Enter)
     result_header = ttk.Frame(main)
-    result_header.grid(row=11, column=0, sticky=(tk.W, tk.E), pady=(0, 4))
+    result_header.grid(row=12, column=0, sticky=(tk.W, tk.E), pady=(0, 4))
     result_header.columnconfigure(1, weight=1)
     ttk.Label(result_header, text="Результат:").grid(row=0, column=0, sticky=tk.W)
     btn_form = ttk.Button(result_header, text="Сформировать", command=run_parser)

@@ -219,7 +219,7 @@ class PFFStreamParser:
 
     def _fields_to_event(self, fields, mod_idx, line_idx, code_idx, total_idx, pure_idx, level_idx=None,
                          sig_idx=None, ctx_idx=None, client_idx=None, server_idx=None, obrabotka_idx=None,
-                         percent_idx=None):
+                         percent_idx=None, count_idx=None, ext_guid_idx=None, ext_type_idx=None, ext_name_idx=None):
         """Преобразует поля записи в событие. При level_idx=None подставляется Level=0 (формат 2b).
         Контекст: при заданных client_idx, server_idx, obrabotka_idx — по трём полям; иначе ctx_idx (форматы 1, 2c).
         При percent_idx (формат 2b): общее время блока выводим как time_sec * 100 / percent (_block_total_sec)."""
@@ -232,6 +232,15 @@ class PFFStreamParser:
             "Pure": float(fields[pure_idx]) * 1000,
             "Level": int(fields[level_idx]) if level_idx is not None else 0
         }
+        
+        if count_idx is not None and count_idx < len(fields):
+            try:
+                evt["Count"] = int(fields[count_idx])
+            except (ValueError, TypeError):
+                evt["Count"] = 1
+        else:
+            evt["Count"] = 1
+
         if percent_idx is not None and percent_idx < len(fields):
             try:
                 pct = float(fields[percent_idx])
@@ -252,12 +261,29 @@ class PFFStreamParser:
                 evt["Context"] = None
         else:
             evt["Context"] = None
-        if sig_idx is not None and sig_idx < len(fields):
+            
+        # Extension fields
+        if ext_name_idx is not None and ext_name_idx < len(fields):
+            ext_name = fields[ext_name_idx]
+            if isinstance(ext_name, str) and ext_name:
+                evt["Extension"] = ext_name
+        elif sig_idx is not None and sig_idx < len(fields):
+            # Legacy parsing from raw signature string (if needed)
             sig_raw = fields[sig_idx]
             if isinstance(sig_raw, str):
                 ext = _parse_sig_extension(sig_raw)
                 if ext:
                     evt["Extension"] = ext
+                    
+        if ext_guid_idx is not None and ext_guid_idx < len(fields):
+            evt["ExtGUID"] = fields[ext_guid_idx]
+            
+        if ext_type_idx is not None and ext_type_idx < len(fields):
+             try:
+                evt["ExtType"] = int(fields[ext_type_idx])
+             except (ValueError, TypeError):
+                pass
+
         return evt
 
     def _parse_wrapped_block_events(self, block_content):
@@ -278,6 +304,27 @@ class PFFStreamParser:
         """Парсит вложенный блок с записями (формат 2b). Раскладка по отчёту АнализЗамеров (Пример замера, BSL-шаблон):
         индексы 8=Модуль, 9=НомерСтроки, 10=Текст, 11=Количество, 12=ВремяЧистоеСВложенными(сек), 13=ВремяЧистое(сек),
         14-15=проценты не для времени, 16=Клиент, 17=Сервер, 18=ОбработкаСервером. Level в записи нет — подставляем 0.
+        
+        Indices based on flattened signature:
+        0: {"",0}
+        1: ModGUID
+        2: ConfGUID
+        3: ObjType
+        4: ExtGUID
+        5: ExtType
+        6: Base64
+        7: ExtName
+        8: Module
+        9: Line
+        10: Code
+        11: Count
+        12: Total
+        13: Pure
+        14: Tot%
+        15: Pure%
+        16: Cli
+        17: Srv
+        18: SrvProc
         """
         sub = PFFStreamParser(block_content)
         if not sub._skip_until('{'): return
@@ -297,7 +344,11 @@ class PFFStreamParser:
                 yield sub._fields_to_event(
                     fields, 8, 9, 10, 12, 13,
                     sig_idx=0, client_idx=16, server_idx=17, obrabotka_idx=18,
-                    percent_idx=14
+                    percent_idx=14,
+                    count_idx=11,
+                    ext_guid_idx=4,
+                    ext_type_idx=5,
+                    ext_name_idx=7
                 )
             except (TypeError, ValueError, IndexError):
                 pass
@@ -504,8 +555,289 @@ def classify_block(events, block_id):
 CONTEXT_COL_WIDTH = 5  # "[C→S]" = 5 символов
 
 
+
+class CallTreeBuilder:
+    """
+    Восстанавливает дерево вызовов из плоского списка событий.
+    Алгоритм:
+    1. Группировка событий в "Процедуры" (непрерывные блоки выполнения одного модуля).
+    2. Поиск "Вызовов" внутри процедур (Total > Pure).
+    3. Связывание Вызовов с Процедурами-кандидатами по времени и имени модуля.
+    4. Построение дерева и генерация плоского списка с правильными Level.
+    """
+    def __init__(self, events):
+        self.raw_events = events
+        self.procedures = []
+        self.roots = []
+        self.module_map = {}  # ShortName -> [FullNames]
+
+    def build(self):
+        if not self.raw_events:
+            return []
+        
+        # 0. Предварительный анализ модулей
+        self._analyze_modules()
+
+        # 1. Группировка в процедуры
+        self._group_into_procedures()
+
+        # 2. Связывание (Matching)
+        self._link_procedures()
+
+        # 3. Сборка результата
+        return self._flatten_tree()
+
+    def _analyze_modules(self):
+        """Собирает карту имен модулей для разрешения вызовов."""
+        unique_modules = set(e['Module'] for e in self.raw_events)
+        for full_name in unique_modules:
+            # Если есть расширение, убираем его из имени для маппинга
+            # Но мы не знаем, какое расширение у конкретного имени, если смотрим только на строку.
+            # Лучше смотреть на события.
+            pass
+
+        # Пересобираем карту проходом по событиям
+        for e in self.raw_events:
+            full_name = e['Module']
+            ext_name = e.get('Extension')
+            
+            base_name = full_name
+            if ext_name and full_name.startswith(ext_name + ' '):
+                base_name = full_name[len(ext_name)+1:]
+            
+            # Эвристика: последнее слово перед .Модуль или просто последнее слово
+            parts = base_name.split('.')
+            if len(parts) > 1:
+                if parts[-1] == 'Модуль':
+                    short = parts[-2]
+                else:
+                    short = parts[-1]
+                
+                if short not in self.module_map:
+                    self.module_map[short] = set()
+                self.module_map[short].add(base_name)
+                # Также добавляем полное имя как ключ (для точных совпадений)
+                if base_name not in self.module_map:
+                     self.module_map[base_name] = set()
+                self.module_map[base_name].add(base_name)
+
+    def _group_into_procedures(self):
+        """Разбивает поток событий на логические процедуры."""
+        if not self.raw_events:
+            return
+
+        current_proc = []
+        last_event = None
+
+        for e in self.raw_events:
+            # Эвристика разрыва процедуры:
+            # 1. Смена модуля
+            # 2. Смена контекста (C -> S)
+            # 3. Скачок номера строки назад (кроме циклов)
+            # 4. Явный конец процедуры в предыдущей строке
+            
+            is_new = False
+            if last_event:
+                if e['Module'] != last_event['Module']:
+                    is_new = True
+                elif e['Context'] != last_event['Context']:
+                    is_new = True
+                elif e['Line'] < last_event['Line'] and not self._is_loop_jump(last_event, e):
+                    is_new = True
+                elif 'КонецПроцедуры' in last_event['Code'] or 'КонецФункции' in last_event['Code']:
+                     is_new = True
+
+            if is_new and current_proc:
+                self._finalize_procedure(current_proc)
+                current_proc = []
+
+            current_proc.append(e)
+            last_event = e
+
+        if current_proc:
+            self._finalize_procedure(current_proc)
+
+    def _is_loop_jump(self, prev, curr):
+        """Проверка, является ли скачок назад циклом (КонецЦикла -> Для/Пока)."""
+        if 'КонецЦикла' in prev['Code']:
+            return True
+        return False
+
+    def _finalize_procedure(self, events):
+        """Создает объект процедуры из списка событий."""
+        if not events:
+            return
+        
+        # Эвристика длительности: сумма PureTime + (TotalTime - PureTime) вызовов?
+        # Нет, мы не знаем вызовов.
+        # Но для матчинга нам нужно TotalTime процедуры.
+        # Если процедура линейная (без вложенных вызовов), то Total ≈ Pure.
+        # Если есть вызовы, то Total строки вызова включает время вызова.
+        # Значит, TotalTime всей процедуры ≈ Сумма TotalTime всех её строк?
+        # НЕТ! Если строка 1 вызывает A (10с), а строка 2 вызывает B (5с),
+        # то TotalTime процедуры = 10 + 5 + PureTime остальных строк.
+        # То есть ДА, сумма TotalTime всех строк процедуры — это и есть её полное время выполнения (включая ожидание детей).
+        # Потому что 1С замеряет каждую строку отдельно.
+        # Исключение: циклы. Если строка выполняется N раз, TotalTime — это сумма всех выполнений?
+        # В PFF строка с Count > 1 имеет TotalTime = сумма всех проходов.
+        # Значит, Sum(TotalTime) по всем строкам процедуры — это корректная оценка длительности выполнения процедуры.
+        
+        total_time = sum(e['Total'] for e in events)
+        pure_time = sum(e['Pure'] for e in events)
+        
+        # Определяем базовое имя модуля (без расширения)
+        full_name = events[0]['Module']
+        ext_name = events[0].get('Extension')
+        base_name = full_name
+        if ext_name and full_name.startswith(ext_name + ' '):
+            base_name = full_name[len(ext_name)+1:]
+
+        proc_obj = {
+            'id': id(events),
+            'module': full_name,
+            'base_module': base_name,
+            'extension': ext_name,
+            'events': events,
+            'total_time': total_time,
+            'pure_time': pure_time,
+            'parent': None,
+            'children': [], # (event_index, proc_obj)
+            'context': events[0].get('Context')
+        }
+        self.procedures.append(proc_obj)
+
+    def _link_procedures(self):
+        """Связывает вызовы с процедурами."""
+        # Проход по всем процедурам и их событиям
+        for proc in self.procedures:
+            for i, event in enumerate(proc['events']):
+                # Ищем вызовы: Total > Pure + threshold
+                diff = event['Total'] - event['Pure']
+                # Порог: 0.05 мс (50 мкс) — достаточно мало, но отсекает шум
+                if diff > 0.05: 
+                    self._find_match(proc, i, event, diff)
+
+        # Все процедуры без parent — корни
+        self.roots = [p for p in self.procedures if p['parent'] is None]
+
+    def _find_match(self, caller_proc, event_idx, event, duration_budget):
+        """Ищет подходящую процедуру для вызова."""
+        code = event['Code']
+        target_mod_short, target_method = self._parse_code_call(code)
+        
+        candidates = []
+        
+        for cand in self.procedures:
+            if cand['parent'] is not None:
+                continue # Уже привязан
+            if cand is caller_proc:
+                continue 
+
+            # 1. Проверка модуля
+            if not self._match_module(caller_proc, target_mod_short, cand):
+                continue
+
+            # 2. Проверка времени
+            # Время процедуры должно быть примерно равно duration_budget
+            # Допуск: +/- 20% или +/- 1ms (время может "гулять" из-за накладных расходов замера)
+            delta = abs(cand['total_time'] - duration_budget)
+            
+            # Критерий: ошибка меньше 20% или меньше 0.5мс
+            if delta < 0.5 or (duration_budget > 0 and delta / duration_budget < 0.2):
+                candidates.append((delta, cand))
+
+        if not candidates:
+            return
+
+        # Берем лучшего кандидата по времени
+        candidates.sort(key=lambda x: x[0])
+        best_cand = candidates[0][1]
+        
+        # Привязываем
+        best_cand['parent'] = caller_proc
+        caller_proc['children'].append((event_idx, best_cand))
+
+    def _parse_code_call(self, code):
+        """Извлекает (Module, Method) из строки кода."""
+        code = code.strip()
+        if code.startswith('//'): return None, None
+        
+        # Убираем ; и ()
+        clean = code.split('(')[0].replace(';', '').strip()
+        
+        if ' = ' in clean: 
+             parts = clean.split(' = ')
+             clean = parts[-1].strip()
+        
+        if ' ' in clean: 
+             # Проверяем "ВызватьИсключение"
+             if clean.startswith('ВызватьИсключение'):
+                 return None, None
+             return None, None 
+
+        parts = clean.split('.')
+        if len(parts) > 1:
+            return parts[0], parts[1] # Module, Method
+        else:
+            return None, clean # None, Method (Self call)
+
+    def _match_module(self, caller_proc, target_short, candidate_proc):
+        """Проверяет, подходит ли кандидат под вызов."""
+        cand_base = candidate_proc['base_module']
+        caller_base = caller_proc['base_module']
+        
+        if target_short:
+            # Вызов Модуль.Метод()
+            # Кандидат должен соответствовать target_short
+            
+            possible_fulls = self.module_map.get(target_short, set())
+            if cand_base in possible_fulls:
+                return True
+            
+            return False
+        else:
+            # Вызов Метод() (внутри модуля)
+            # Кандидат должен быть тем же модулем (или его расширением)
+            if cand_base == caller_base:
+                return True
+            
+            return False
+
+    def _flatten_tree(self):
+        """Обходит дерево и генерирует плоский список."""
+        result = []
+        
+        # Сортируем детей внутри процедур по индексу вызова
+        for proc in self.procedures:
+            proc['children'].sort(key=lambda x: x[0])
+
+        # Обход корней
+        for root in self.roots:
+            self._traverse(root, 0, result)
+            
+        return result
+
+    def _traverse(self, proc, level, result):
+        """DFS обход."""
+        # Индекс текущего ребенка
+        child_idx = 0
+        children = proc['children']
+        
+        for i, event in enumerate(proc['events']):
+            # Копируем событие и ставим Level
+            e_copy = event.copy()
+            e_copy['Level'] = level
+            result.append(e_copy)
+            
+            # Если после этой строки должен быть вызов ребенка
+            # Проверяем, есть ли дети, привязанные к этому индексу
+            while child_idx < len(children) and children[child_idx][0] == i:
+                child_proc = children[child_idx][1]
+                self._traverse(child_proc, level + 1, result)
+                child_idx += 1
+
 class ReportGenerator:
-    def __init__(self, events, threshold_ms=None, all_events=None, compact=True, show_context=True, expand_module_names=True):
+    def __init__(self, events, threshold_ms=None, all_events=None, compact=True, show_context=True, expand_module_names=True, highlight_extensions=True):
         self.events = events
         self.all_events = all_events if all_events is not None else events
         self.modules_map = {}
@@ -514,6 +846,7 @@ class ReportGenerator:
         self.compact = compact
         self.show_context = show_context
         self.expand_module_names = expand_module_names
+        self.highlight_extensions = highlight_extensions
 
         if events:
             min_level = min(e['Level'] for e in events)
@@ -556,11 +889,24 @@ class ReportGenerator:
         lines.append(f"Основная ветвь (L0): {main_branch_time/1000:.2f} с ({pct:.0f}%)")
         return "\n".join(lines)
 
+    def _format_location(self, module, line, extension=None):
+        """Форматирует местоположение: [Ext:Name] Module:Line"""
+        mod_name = module
+        if extension and module.startswith(extension + ' '):
+            mod_name = module[len(extension)+1:]
+            
+        mid = self.get_module_id(mod_name)
+        loc = f"{mid}:{line}" if mid else f":{line}"
+        
+        if extension:
+            return f"[Ext:{extension}] {loc}"
+        return loc
+
     def generate_trace(self):
         """TRACE: полный последовательный лог (без сжатия, для reasoning)."""
         lines = []
         lines.append("=== TRACE (полный последовательный) ===")
-        fmt = "Формат: E# [Level] [Ctx] отступ Модуль:Строка | Код" if self.show_context else "Формат: E# [Level] отступ Модуль:Строка | Код"
+        fmt = "Формат: E# [Level] [Ctx] отступ [Ext:Name] Модуль:Строка | Код"
         lines.append(fmt)
         lines.append("")
         lines.append("  E#       — порядковый номер события (хронологический порядок)")
@@ -568,6 +914,7 @@ class ReportGenerator:
         if self.show_context:
             lines.append("  [Ctx]    — контекст в каждой строке события: [C]=Клиент, [S]=Сервер, [C→S]=вызов с клиента, выполнение на сервере (Обр. сервером); [?]=неизвестный контекст в PFF.")
         lines.append("  indent   — 2 пробела на уровень (визуальный стек; больше отступ = глубже вызов)")
+        lines.append("  [Ext:..] — имя расширения, если код выполняется в нём")
         lines.append("  Module   — имя модуля выводится только при смене (иначе только :Строка)")
         lines.append("  Line     — номер строки исходного кода в этом модуле")
         lines.append("  Code     — фрагмент кода 1С на этой строке")
@@ -577,6 +924,7 @@ class ReportGenerator:
 
         prev_block = None
         prev_module = None
+        prev_extension = None
         prev_level = None
         prev_line = None
         prev_context = None
@@ -588,39 +936,63 @@ class ReportGenerator:
                     lines.append(f"### B{prev_block} КОНЕЦ ###")
                 prev_block = bid
                 prev_module = None
+                prev_extension = None
                 prev_level = None
                 prev_line = None
                 prev_context = None  # force context on first line of block
                 block_events = sum(1 for x in self.events if x.get('block_id', 0) == bid)
                 bt = classify_block(self.all_events, bid)
                 lines.append(f"### B{bid} НАЧАЛО ({block_events} соб., {bt}) ###")
+            
             ctx = e.get('Context')
             ctx_label = context_label(ctx) if ctx is not None else '?'
             ctx_str = f"[{ctx_label}] " if self.show_context else ""
             prev_context = ctx
+            
             code_raw = e['Code'].replace('\r', '').strip()
             code_lines = code_raw.split('\n')
+            
+            ext = e.get('Extension')
+            
             is_continuation = (
                 self.compact and prev_module is not None and prev_level is not None and prev_line is not None
-                and e['Module'] == prev_module and e['Level'] == prev_level
+                and e['Module'] == prev_module and ext == prev_extension and e['Level'] == prev_level
                 and abs(e['Line'] - prev_line) <= 2
             )
+            
             if is_continuation:
                 for code_line in code_lines:
                     lines.append(f"            | {code_line}")
             else:
-                show_module = prev_module is None or e['Module'] != prev_module
-                mid = self.get_module_id(e['Module']) if show_module else ""
-                location = f"{mid}:{e['Line']}" if mid else f":{e['Line']}"
+                show_module = (prev_module is None or e['Module'] != prev_module or ext != prev_extension)
+                
+                mod_name = e['Module']
+                if ext and mod_name.startswith(ext + ' '):
+                    mod_name = mod_name[len(ext)+1:]
+                
+                mid = self.get_module_id(mod_name) if show_module else ""
+                
+                # Формируем локацию
+                if show_module:
+                    if ext and self.highlight_extensions:
+                        location = f"[Ext:{ext}] {mid}:{e['Line']}"
+                    else:
+                        location = f"{mid}:{e['Line']}"
+                else:
+                    location = f":{e['Line']}"
+
                 indent = "  " * e['Level']
                 for j, code_line in enumerate(code_lines):
                     if j == 0:
                         lines.append(f"E{i+1:05d} [L{e['Level']}] {ctx_str}{indent}{location} | {code_line}")
                     else:
                         lines.append(f"            | {code_line}")
+            
             prev_module = e['Module']
+            prev_extension = ext
             prev_level = e['Level']
             prev_line = e['Line']
+            
         if prev_block is not None:
             lines.append(f"### B{prev_block} КОНЕЦ ###")
 
@@ -661,7 +1033,7 @@ class ReportGenerator:
             tree_lines.append("Контекст показывается только при смене; при одном контексте — только у первой строки. [C]=Клиент, [S]=Сервер, [C→S]=Клиент вызывает Сервер.")
         tree_lines.append("-" * 80)
 
-        self._print_tree(root, tree_lines, 0, None, None)
+        self._print_tree(root, tree_lines, 0, None, None, None)
 
         # 4. Hotspots
         hotspots_lines = []
@@ -673,9 +1045,10 @@ class ReportGenerator:
         agg = {}
         for e in self.events:
             ctx = e.get('Context')
-            key = (e['Module'], e['Line'], ctx)
+            ext = e.get('Extension')
+            key = (e['Module'], e['Line'], ctx, ext)
             if key not in agg:
-                agg[key] = {'pure': 0, 'count': 0, 'code': e['Code'], 'mod': e['Module'], 'ctx': ctx}
+                agg[key] = {'pure': 0, 'count': 0, 'code': e['Code'], 'mod': e['Module'], 'ctx': ctx, 'ext': ext}
             agg[key]['pure'] += e['Pure']
             agg[key]['count'] += 1
 
@@ -683,16 +1056,36 @@ class ReportGenerator:
 
         prev_hotspot_ctx = None
         prev_hotspot_mod = None
+        prev_hotspot_ext = None
+        
         for i, (key, val) in enumerate(sorted_agg[:10]):
             ctx = val['ctx']
+            ext = val['ext']
+            
             ctx_label = context_label(ctx) if ctx is not None else ""
             show_ctx = self.show_context and (prev_hotspot_ctx != ctx or (ctx_label and prev_hotspot_ctx is None))
             ctx_str = f"[{ctx_label}] " if show_ctx and ctx_label else (" " * (CONTEXT_COL_WIDTH + 1) if self.show_context else "")
             prev_hotspot_ctx = ctx
-            show_module = prev_hotspot_mod is None or val['mod'] != prev_hotspot_mod
-            mid = self.get_module_id(val['mod']) if show_module else ""
-            location = f"{mid}:{key[1]}" if mid else f":{key[1]}"
+            
+            show_module = (prev_hotspot_mod is None or val['mod'] != prev_hotspot_mod or ext != prev_hotspot_ext)
+            
+            mod_name = val['mod']
+            if ext and mod_name.startswith(ext + ' '):
+                mod_name = mod_name[len(ext)+1:]
+            
+            mid = self.get_module_id(mod_name) if show_module else ""
+            
+            if show_module:
+                if ext and self.highlight_extensions:
+                    location = f"[Ext:{ext}] {mid}:{key[1]}"
+                else:
+                    location = f"{mid}:{key[1]}"
+            else:
+                location = f":{key[1]}"
+            
             prev_hotspot_mod = val['mod']
+            prev_hotspot_ext = ext
+            
             code_snip = val['code'].strip().replace('\n', ' ')[:80]
             hotspots_lines.append(f"#{i+1} {ctx_str}{location} | Чистое: {val['pure']:.2f} мс ({val['count']}x) | {code_snip}")
 
@@ -707,25 +1100,42 @@ class ReportGenerator:
         node['significant'] = is_sig or child_sig
         return node['significant']
 
-    def _print_tree(self, node, lines, indent_level, prev_context, prev_module):
-        """Рекурсивный вывод дерева. Возвращает последний выведенный модуль (для сжатия повторов)."""
+    def _print_tree(self, node, lines, indent_level, prev_context, prev_module, prev_extension):
+        """Рекурсивный вывод дерева. Возвращает (последний модуль, последнее расширение)."""
         if node['event'] is None:
             last_mod = prev_module
+            last_ext = prev_extension
             for child in node['children']:
-                last_mod = self._print_tree(child, lines, 0, prev_context, last_mod)
-            return last_mod
+                last_mod, last_ext = self._print_tree(child, lines, 0, prev_context, last_mod, last_ext)
+            return last_mod, last_ext
 
         if not node['significant']:
-            return prev_module
+            return prev_module, prev_extension
 
         e = node['event']
         ctx = e.get('Context')
+        ext = e.get('Extension')
+        
         ctx_label = context_label(ctx) if ctx is not None else ""
         show_ctx = self.show_context and (prev_context != ctx or (ctx_label and prev_context is None))
         ctx_str = f"[{ctx_label}] " if show_ctx and ctx_label else (" " * (CONTEXT_COL_WIDTH + 1) if self.show_context else "")
-        show_module = prev_module is None or e['Module'] != prev_module
-        mid = self.get_module_id(e['Module']) if show_module else ""
-        location = f"{mid}:{e['Line']}" if mid else f":{e['Line']}"
+        
+        show_module = (prev_module is None or e['Module'] != prev_module or ext != prev_extension)
+        
+        mod_name = e['Module']
+        if ext and mod_name.startswith(ext + ' '):
+            mod_name = mod_name[len(ext)+1:]
+            
+        mid = self.get_module_id(mod_name) if show_module else ""
+        
+        if show_module:
+            if ext and self.highlight_extensions:
+                location = f"[Ext:{ext}] {mid}:{e['Line']}"
+            else:
+                location = f"{mid}:{e['Line']}"
+        else:
+            location = f":{e['Line']}"
+            
         indent = "  " * indent_level
         code_snip = e['Code'].strip().replace('\n', ' ')[:60]
         lines.append(f"{indent}{ctx_str}{location} | {code_snip} [Всего: {e['Total']:.2f} мс]")
@@ -733,16 +1143,18 @@ class ReportGenerator:
         hidden_count = 0
         hidden_time = 0
         last_mod = e['Module']
+        last_ext = ext
+        
         for child in node['children']:
             if child['significant']:
-                last_mod = self._print_tree(child, lines, indent_level + 1, ctx, last_mod)
+                last_mod, last_ext = self._print_tree(child, lines, indent_level + 1, ctx, last_mod, last_ext)
             else:
                 hidden_count += 1
                 hidden_time += child['total']
 
         if hidden_count > 0:
             lines.append(f"{indent}  [+ {hidden_count} мелких вызовов: {hidden_time:.2f} мс]")
-        return last_mod
+        return last_mod, last_ext
 
     def _ensure_modules(self):
         """Предзаполнить легенду модулей из событий."""
@@ -805,7 +1217,7 @@ class ReportGenerator:
 
 def process_pff(file_path, entry=None, main_block=None,
                 threshold_ms=None, no_perf=False, perf_only=False, no_hotspots=False, no_compact=False,
-                no_context=False, expand_module_names=True, include_model_prompt=True):
+                no_context=False, expand_module_names=True, include_model_prompt=True, highlight_extensions=True):
     if not os.path.exists(file_path):
         return "File not found."
 
@@ -817,6 +1229,10 @@ def process_pff(file_path, entry=None, main_block=None,
 
     if not all_evts:
         return "No trace events found in file."
+
+    # Восстановление стека вызовов (Phase 4.2)
+    builder = CallTreeBuilder(all_evts)
+    all_evts = builder.build()
 
     num_blocks = len(set(e.get('block_id', 0) for e in all_evts))
 
@@ -851,7 +1267,7 @@ def process_pff(file_path, entry=None, main_block=None,
         blocks_info = "1"
         entry_info = "все"
 
-    generator = ReportGenerator(events, threshold_ms, all_events=all_evts, compact=not no_compact, show_context=not no_context, expand_module_names=expand_module_names)
+    generator = ReportGenerator(events, threshold_ms, all_events=all_evts, compact=not no_compact, show_context=not no_context, expand_module_names=expand_module_names, highlight_extensions=highlight_extensions)
     if perf_only:
         include_trace = False
         include_perf = True
