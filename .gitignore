@@ -13,7 +13,6 @@ dist/
 .vscode/
 .cursor/
 *.log
-*.txt
 !requirements.txt
 !LICENSE
 !README.md
