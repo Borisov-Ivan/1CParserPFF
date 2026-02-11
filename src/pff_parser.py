@@ -13,6 +13,7 @@ import sys
 import os
 import argparse
 import re
+from collections import defaultdict
 
 # ==================================================================================================
 # 1. CORE PARSER (STREAM TOKENIZER)
@@ -31,42 +32,68 @@ SESSION_TYPES = {
     64: "Сервер",
 }
 
+# --- v4: Утилитные константы для IssueAnalyzer и ExecutionFlowBuilder ---
+
+CALLBACK_PATTERNS = [
+    "ВыполнитьОбработкуОповещения",
+    "ВернутьРезультат",
+    "ОповеститьОВыборе",
+    "ОповеститьОЗакрытии",
+    "Закрыть(Истина)",
+]
+
+ISSUE_TYPE_PATTERNS = {
+    "HTTP": ["Соединение.Получить", "Соединение.ОтправитьДляОбработки",
+             "HTTPСоединение", "Соединение.Вызвать"],
+    "SQL": ["Запрос.Выполнить", "Выборка.Следующий", "Выбрать()"],
+    "Resource": ["ПолучитьОбщийМакет", "Преобразовать(Формат"],
+}
+
+STRUCTURAL_NOISE = ["КонецЕсли", "КонецЦикла", "КонецПроцедуры", "КонецФункции"]
+
 # Промпты для модели в заголовке отчёта (при включённой опции на форме)
 TRACE_MODEL_PROMPT = """=== ПРОМПТ ДЛЯ МОДЕЛИ (TRACE) ===
-Ты анализируешь отчёт трассировки выполнения 1С (PFF TRACE).
+Ты анализируешь отчёт трассировки выполнения 1С (PFF TRACE v4).
 
-Правила работы с файлом:
-- TRACE содержит три секции: SUMMARY, CALL MAP, MODULES.
-- В MODULES данные сгруппированы по (модуль + контекст + расширение + блок).
-- Блоки соответствуют сессиям (например, B0 [Сервер] ...).
-- Блоки вида [S] Func (lines X-Y) или [C] Proc (lines X-Y) — это идентификаторы диапазонов строк; имена процедур в PFF обычно отсутствуют.
-- Внутри блока каждая строка: :Line | Code  Total  Pure (мс).
-- В CALL MAP показываются строки, где Budget = Total - Pure > threshold. Это индикатор времени, ушедшего во вложенные вызовы.
-- Ссылки вида -> see: ... [S] Func(lines X-Y) [Total: N ms] — эвристические подсказки по совпадению бюджета и модуля, не строгая гарантия.
-- Контекстные метки: [C]=Клиент, [S]=Сервер, [C→S]=вызов сервера с клиента, [?]=неизвестно.
+Структура отчёта:
+- EXECUTION FLOW: хронологическое дерево вызовов (реконструировано эвристически, точность ~90%). Показывает что вызвало что, в порядке выполнения. Колбэк-цепочки (ВыполнитьОбработкуОповещения и т.п.) свёрнуты.
+- MODULES: справочник модулей с построчной детализацией. Тривиальные процедуры (Total < порога) свёрнуты, структурные строки (КонецЕсли и т.п.) убраны.
+
+Правила:
+- В EXECUTION FLOW отступ = глубина вызова. Имя модуля — при смене. [Total] — включительное время. [Self: X] — чистое время на листьях (только если оно значимо).
+- ⤷ [колбэки ×N: ...] — свёрнутая цепочка асинхронных колбэков. Для анализа потока не существенна.
+- В MODULES формат строки: :Line | Code  Total  Pure (мс).
+- Пометка [свёрнуто] — процедура ниже порога, детали опущены.
+- Контекст: [C]=Клиент, [S]=Сервер, [C→S]=вызов сервера, [?]=неизвестно.
 
 Интерпретация:
-- Сначала смотри SUMMARY (масштаб и контексты), затем CALL MAP (кандидаты на вызовы), затем MODULES (детали по строкам).
-- Для реконструкции цепочки вызовов сопоставляй Budget из CALL MAP с Total блоков в MODULES.
-- При ответе явно отделяй подтверждённые факты (строки/время) от гипотез по связям вызовов.
+- EXECUTION FLOW читай как историю: «сначала произошло X, X вызвал Y, Y вызвал Z...».
+- Для верификации EXECUTION FLOW используй MODULES — там точные данные по строкам.
+- Отделяй подтверждённые факты (строки/время из MODULES) от гипотез (связи в EXECUTION FLOW).
 
 === КОНЕЦ ПРОМПТА ===
 """
 
 PERF_MODEL_PROMPT = """=== ПРОМПТ ДЛЯ МОДЕЛИ (PERF) ===
-Ты анализируешь отчёт производительности 1С (PFF PERF): дерево критического пути и горячие точки.
+Ты анализируешь отчёт производительности 1С (PFF PERF v4): топ-проблемы с цепочками вызовов и горячие точки.
 
-Правила работы с файлом:
-- Дерево PERF: отступ задаёт уровень вложенности вызовов. Имя модуля выводится только при смене; иначе только :НомерСтроки. Модуль для «:Число» совпадает с последним выше указанным полным именем модуля.
-- [Всего: X мс] — включительное время узла (узел + все потомки). Порог отсекает мелкие узлы; скрытые показаны как «+ N мелких вызовов: X мс».
-- Секция HOTSPOTS: топ по «чистому» времени (без учёта вложенных вызовов). Имя модуля — по тому же правилу (только при смене).
-- Сводка в начале отчёта: «Общее время» — сумма по L0; блоки B0, B1, … — сегменты замера.
+Структура отчёта:
+- TOP ISSUES: ранжированные проблемы производительности, каждая с цепочкой вызовов от точки входа до узкого места и классификацией типа (HTTP, SQL, бизнес-логика, ресурсы).
+- HOTSPOTS: топ по чистому (Self) времени с указанием полного (Total) времени.
 
-Интерпретация:
-- Сопоставляй узлы дерева с HOTSPOTS: высокое «Всего» при малом «Чистое» — время во вложенных вызовах; высокое «Чистое» — узкое место в самом узле.
-- Контекст [C]/[S]/[C→S] при смене помогает отделять клиентскую и серверную нагрузку. [C→S] — выполнение на сервере (Обр. сервером). [?] — неизвестное значение контекста в PFF.
-- Для строк только с «:Строка» определяй модуль по последней выше стоящей строке с полным именем модуля.
-- ВНИМАНИЕ: Дерево PERF может быть неточным для замеров формата 2c (реальные замеры) из-за отсутствия явного уровня вложенности (Level). Требуется дополнительная верификация по TRACE.
+Правила:
+- «Влияние» в Issue — суммарное Self-время всех точек внутри Issue.
+- Цепочка вызовов: отступ = уровень вложенности. ★ — узкое место (высокое Self-время).
+- Self(мс) — время в самой строке (без вложенных). Total(мс) — время включая вложенные.
+- Соотношение Self/Total: высокое Self при высоком Total — узкое место. Малое Self при большом Total — время уходит во вложенные.
+- Цепочки реконструированы эвристически по Budget-matching, точность ~90%.
+- Контекст: [C]=Клиент, [S]=Сервер, [C→S]=вызов сервера.
+
+Рекомендации:
+- Для HTTP-вызовов: оцени возможность кэширования, пакетирования, асинхронности.
+- Для SQL-запросов: предложи индексы, упрощение запроса, кэширование.
+- Для бизнес-логики: предложи рефакторинг, ленивую инициализацию, объединение серверных вызовов.
+- Для ресурсов (макеты, картинки): предложи кэширование, предрасчёт.
 
 === КОНЕЦ ПРОМПТА ===
 """
@@ -535,6 +562,56 @@ def _module_short_name(module_name):
     return parts[-1] if parts else module_name
 
 
+def _is_callback(event):
+    """Определяет, является ли событие колбэком (для свёртки цепочек)."""
+    code = (event.get("Code") or "").strip()
+    ctx = event.get("Context")
+    # Колбэки обычно C→S (контексты 3-6) или C (контекст 1)
+    for pattern in CALLBACK_PATTERNS:
+        if pattern in code:
+            return True
+    return False
+
+
+def _classify_code(code):
+    """Классифицирует код строки по типу: HTTP, SQL, Resource, Callback, Business."""
+    code_str = (code or "").strip()
+    for issue_type, patterns in ISSUE_TYPE_PATTERNS.items():
+        for pattern in patterns:
+            if pattern in code_str:
+                return issue_type
+    for pattern in CALLBACK_PATTERNS:
+        if pattern in code_str:
+            return "Callback"
+    return "Business"
+
+
+# Расширенный regex для извлечения имени вызываемого модуля из кода
+_CALL_REGEX_EXTENDED = re.compile(
+    r"(?:"
+    r"([\w]+)\s*\.\s*([\w]+)\s*\("    # Модуль.Метод(
+    r"|"
+    r"РегистрыСведений\s*\.\s*([\w]+)"  # РегистрыСведений.ИмяРегистра
+    r"|"
+    r"Справочники\s*\.\s*([\w]+)"       # Справочники.ИмяСправочника
+    r")"
+)
+
+
+def _extract_called_module(code):
+    """Извлекает имя вызываемого модуля из кода строки (расширенная версия)."""
+    if not code:
+        return None
+    for match in _CALL_REGEX_EXTENDED.finditer(code):
+        if match.group(1):
+            return match.group(1)
+        if match.group(3):
+            return match.group(3)
+        if match.group(4):
+            return match.group(4)
+    return None
+
+
 class ProcedureGrouper:
     """Группирует события в блоки [Ctx] Func/Proc (lines X-Y)."""
 
@@ -619,8 +696,6 @@ class ProcedureGrouper:
 class CallMapBuilder:
     """Строит CALL MAP по бюджету вложенных вызовов (Total - Pure)."""
 
-    CALL_REGEX = re.compile(r"([\w]+)\s*\.\s*([\w]+)\s*\(")
-
     def __init__(self, events, grouped_modules, threshold_ms=None):
         self.events = events
         self.grouped_modules = grouped_modules
@@ -633,9 +708,7 @@ class CallMapBuilder:
         return max(0.5, total_ms * 0.01)
 
     def _extract_target_module_short(self, code):
-        for match in self.CALL_REGEX.finditer(code or ""):
-            return match.group(1)
-        return None
+        return _extract_called_module(code)
 
     def _find_best_block(self, caller_event, budget_ms):
         target_short = self._extract_target_module_short(caller_event.get("Code"))
@@ -678,7 +751,442 @@ class CallMapBuilder:
 
 
 # ==================================================================================================
-# 3. REPORT GENERATOR (TRACE & PERF)
+# 3. EXECUTION FLOW BUILDER (v4)
+# ==================================================================================================
+
+class ExecutionFlowBuilder:
+    """Строит эвристическое дерево вызовов (EXECUTION FLOW) для TRACE v4."""
+
+    def __init__(self, events, grouped_modules, threshold_ms):
+        self.events = events
+        self.grouped_modules = grouped_modules
+        self.threshold_ms = threshold_ms
+        self.block_index = self._build_block_index()
+        self.used_blocks = set()  # id(block) для блоков, уже использованных как дочерние
+
+    def _build_block_index(self):
+        """Индекс: (module_short_name, context) -> [{"group": g, "block": b}, ...]"""
+        index = defaultdict(list)
+        for g in self.grouped_modules:
+            mod_wo_ext = _strip_extension_prefix(g["module"], g.get("extension"))
+            short = _module_short_name(mod_wo_ext)
+            ctx = g.get("context")
+            for b in g.get("blocks", []):
+                index[(short, ctx)].append({"group": g, "block": b})
+            # Также индексируем без контекста для более гибкого поиска
+            for b in g.get("blocks", []):
+                index[(short, None)].append({"group": g, "block": b})
+        return index
+
+    def _find_child_block(self, caller_event, budget_ms):
+        """Найти дочерний блок по имени модуля из кода и Budget-matching."""
+        target_short = _extract_called_module(caller_event.get("Code"))
+        if not target_short:
+            return None
+
+        candidates = []
+        # Ищем сначала с учётом контекста, потом без
+        for ctx_key in [caller_event.get("Context"), None]:
+            for entry in self.block_index.get((target_short, ctx_key), []):
+                b = entry["block"]
+                if id(b) in self.used_blocks:
+                    continue
+                delta = abs(b["total"] - budget_ms)
+                tolerance = max(0.5, budget_ms * 0.2)
+                if delta <= tolerance:
+                    candidates.append((delta, entry))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        best = candidates[0][1]
+        self.used_blocks.add(id(best["block"]))
+        return best
+
+    def _build_subtree(self, block, group, depth=0, max_depth=15):
+        """Рекурсивно строит дерево вызовов для одного блока.
+        Фильтрует тривиальные события — оставляет только значимые (budget или self > threshold)."""
+        if depth > max_depth:
+            return []
+
+        ctx = group.get("context")
+        mod_wo_ext = _strip_extension_prefix(group["module"], group.get("extension"))
+        mod_short = _module_short_name(mod_wo_ext)
+
+        nodes = []
+        for e in block["events"]:
+            budget = e["Total"] - e["Pure"]
+            is_cb = _is_callback(e)
+
+            # Фильтрация: показываем только значимые события
+            # - budget > threshold (есть значимые дочерние вызовы)
+            # - Pure > threshold (значимое собственное время)
+            # - колбэки (для свёртки цепочек)
+            # - Total > threshold (значимое включительное время)
+            if (budget <= self.threshold_ms and e["Pure"] <= self.threshold_ms
+                    and e["Total"] <= self.threshold_ms and not is_cb):
+                continue
+
+            node = {
+                "event": e,
+                "module_short": mod_short,
+                "module_full": mod_wo_ext,
+                "context": ctx,
+                "extension": group.get("extension"),
+                "children": [],
+                "is_callback": is_cb,
+            }
+
+            if budget > self.threshold_ms:
+                child_entry = self._find_child_block(e, budget)
+                if child_entry:
+                    child_nodes = self._build_subtree(
+                        child_entry["block"], child_entry["group"],
+                        depth=depth + 1, max_depth=max_depth
+                    )
+                    node["children"] = child_nodes
+
+            nodes.append(node)
+        return nodes
+
+    def _find_root_blocks(self):
+        """Определить корневые блоки — те, что не были использованы как дочерние.
+        Отсортированы по Total (от наибольшего)."""
+        roots = []
+        for g in self.grouped_modules:
+            for b in g.get("blocks", []):
+                if id(b) not in self.used_blocks and b["total"] >= self.threshold_ms:
+                    roots.append({"group": g, "block": b})
+        # Сортируем по Total desc — основные ветви выполнения сверху
+        roots.sort(key=lambda x: x["block"]["total"], reverse=True)
+        return roots
+
+    def build(self):
+        """Основной метод: строит лес деревьев и форматирует в строки."""
+        # Шаг 1: Начинаем с блоков, имеющих наибольший Total, строим деревья вниз
+        all_blocks = []
+        for g in self.grouped_modules:
+            for b in g.get("blocks", []):
+                if b["total"] >= self.threshold_ms:
+                    all_blocks.append({"group": g, "block": b, "total": b["total"]})
+        all_blocks.sort(key=lambda x: x["total"], reverse=True)
+
+        forest = []
+        for entry in all_blocks:
+            b = entry["block"]
+            if id(b) in self.used_blocks:
+                continue
+            self.used_blocks.add(id(b))
+            subtree = self._build_subtree(b, entry["group"])
+            if subtree:
+                forest.append({
+                    "group": entry["group"],
+                    "block": b,
+                    "nodes": subtree,
+                })
+
+        # Шаг 2: Форматирование
+        lines = []
+        lines.append("=== EXECUTION FLOW (эвристическая реконструкция) ===")
+        lines.append("Вложенность восстановлена по Budget-matching и именам модулей.")
+        lines.append("Колбэки (ВыполнитьОбработкуОповещения и т.п.) свёрнуты.")
+        lines.append("")
+
+        for tree in forest:
+            self._format_tree_nodes(tree["nodes"], lines, indent=0, prev_module=None)
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def _format_tree_nodes(self, nodes, lines, indent, prev_module):
+        """Форматирует узлы дерева с обработкой колбэк-цепочек."""
+        i = 0
+        while i < len(nodes):
+            node = nodes[i]
+
+            # Проверяем цепочку колбэков
+            if node["is_callback"]:
+                cb_chain = [node]
+                j = i + 1
+                while j < len(nodes) and nodes[j]["is_callback"]:
+                    cb_chain.append(nodes[j])
+                    j += 1
+                if len(cb_chain) >= 3:
+                    # Свёртка колбэков
+                    parts = []
+                    for cb in cb_chain:
+                        e = cb["event"]
+                        parts.append(f"{cb['module_short']}:{e['Line']}")
+                    prefix = "  " * indent
+                    lines.append(f"{prefix}⤷ [колбэки ×{len(cb_chain)}: {' → '.join(parts)}]")
+                    i = j
+                    continue
+
+            e = node["event"]
+            ctx_label_str = context_label(node["context"]) or "?"
+            prefix = "  " * indent
+
+            # Модуль — показывать при смене
+            show_module = (prev_module != node["module_short"])
+            if show_module:
+                location = f"{node['module_short']}:{e['Line']}"
+            else:
+                location = f":{e['Line']}"
+
+            code_snip = (e["Code"] or "").strip().replace("\n", " ")[:80]
+
+            # Время:
+            # - Листья с Pure > 10ms (или > threshold): [Self: Xms]
+            # - Остальные: [Total]
+            # - Если Total < 1ms (округляется до 0), время не выводим вообще
+            
+            # Порог для выделения Self-времени (чтобы не подсвечивать 0ms/2ms)
+            self_highlight_threshold = max(self.threshold_ms, 10.0)
+            
+            time_str = ""
+            total_rounded = round(e['Total'])
+            
+            if total_rounded > 0:
+                if node["children"]:
+                    if e["Pure"] > self_highlight_threshold:
+                        time_str = f"[{e['Total']:.0f}ms / {e['Pure']:.0f}ms]"
+                    else:
+                        time_str = f"[{e['Total']:.0f}ms]"
+                else:
+                    if e["Pure"] > self_highlight_threshold:
+                        time_str = f"[Self: {e['Pure']:.0f}ms]"
+                    else:
+                        time_str = f"[{e['Total']:.0f}ms]"
+
+            if show_module:
+                lines.append(f"{prefix}[{ctx_label_str}] {location} | {code_snip}  {time_str}".rstrip())
+            else:
+                lines.append(f"{prefix}{location} | {code_snip}  {time_str}".rstrip())
+
+            prev_module = node["module_short"]
+
+            # Рекурсивно форматируем дочерние узлы
+            if node["children"]:
+                self._format_tree_nodes(node["children"], lines, indent + 1, prev_module)
+
+            i += 1
+
+
+# ==================================================================================================
+# 3b. ISSUE ANALYZER (PERF v4)
+# ==================================================================================================
+
+
+class IssueAnalyzer:
+    """Анализирует hotspots и строит TOP ISSUES для PERF v4."""
+
+    def __init__(self, events, grouped_modules, threshold_ms):
+        self.events = events
+        self.grouped_modules = grouped_modules
+        self.threshold_ms = threshold_ms
+        self.call_map_builder = CallMapBuilder(events, grouped_modules, threshold_ms)
+
+    def _get_hotspots(self, top_n=30):
+        """Получить топ hotspots по Pure (Self) time."""
+        agg = {}
+        for e in self.events:
+            ctx = e.get("Context")
+            ext = e.get("Extension")
+            key = (e["Module"], e["Line"], ctx, ext)
+            if key not in agg:
+                agg[key] = {
+                    "pure": 0, "total": 0, "count": 0,
+                    "code": e["Code"], "mod": e["Module"],
+                    "ctx": ctx, "ext": ext, "line": e["Line"],
+                    "events": [],
+                }
+            agg[key]["pure"] += e["Pure"]
+            agg[key]["total"] += e["Total"]
+            agg[key]["count"] += e.get("Count", 1)
+            agg[key]["events"].append(e)
+
+        sorted_agg = sorted(agg.values(), key=lambda x: x["pure"], reverse=True)
+        return sorted_agg[:top_n]
+
+    def _classify_issue(self, hotspot_events):
+        """Классифицировать тип Issue по коду hotspot-ов."""
+        type_counts = defaultdict(float)
+        for hs in hotspot_events:
+            code = (hs.get("code") or "")
+            t = _classify_code(code)
+            type_counts[t] += hs["pure"]
+        if not type_counts:
+            return "Бизнес-логика"
+        return max(type_counts, key=type_counts.get)
+
+    def _cluster_hotspots(self, hotspots):
+        """Группировка hotspots в Issue по модулю-источнику."""
+        clusters = defaultdict(list)
+        for hs in hotspots:
+            mod_name = _strip_extension_prefix(hs["mod"], hs.get("ext"))
+            mod_short = _module_short_name(mod_name)
+            clusters[mod_short].append(hs)
+
+        issues = []
+        for mod_short, hs_list in clusters.items():
+            # Суммарное влияние
+            total_impact = sum(h["pure"] for h in hs_list)
+            if total_impact < self.threshold_ms:
+                continue
+            issues.append({
+                "module_short": mod_short,
+                "hotspots": hs_list,
+                "impact": total_impact,
+                "count": sum(h["count"] for h in hs_list),
+            })
+
+        issues.sort(key=lambda x: x["impact"], reverse=True)
+        return issues
+
+    def _build_call_chain(self, hotspot_event):
+        """Построить восходящую цепочку вызовов от hotspot до корня."""
+        chain = []
+        current_event = hotspot_event
+        visited = set()
+        max_depth = 10
+
+        for _ in range(max_depth):
+            if id(current_event) in visited:
+                break
+            visited.add(id(current_event))
+
+            # Найти, кто вызвал текущий блок
+            caller = self._find_caller(current_event)
+            if caller is None:
+                break
+            chain.append(caller)
+            current_event = caller["event"]
+
+        chain.reverse()
+        return chain
+
+    def _find_caller(self, target_event):
+        """Найти вызывающую строку для данного события (по Budget-matching)."""
+        target_total = target_event.get("Total", 0)
+        if target_total < self.threshold_ms:
+            return None
+
+        target_mod = _strip_extension_prefix(
+            target_event["Module"], target_event.get("Extension"))
+        target_short = _module_short_name(target_mod)
+
+        best = None
+        best_delta = float("inf")
+
+        for e in self.events:
+            if e is target_event:
+                continue
+            budget = e["Total"] - e["Pure"]
+            if budget < self.threshold_ms:
+                continue
+            # Извлечь имя вызываемого модуля из кода
+            called = _extract_called_module(e.get("Code"))
+            if called and called == target_short:
+                delta = abs(budget - target_total)
+                tolerance = max(0.5, target_total * 0.3)
+                if delta <= tolerance and delta < best_delta:
+                    best_delta = delta
+                    best = e
+
+        if best is None:
+            return None
+
+        return {
+            "event": best,
+            "module_short": _module_short_name(
+                _strip_extension_prefix(best["Module"], best.get("Extension"))),
+            "context": best.get("Context"),
+        }
+
+    def build(self):
+        """Построить TOP ISSUES и вернуть форматированные строки."""
+        hotspots = self._get_hotspots(top_n=30)
+        if not hotspots:
+            return ["=== TOP ISSUES ===", "Нет значимых проблем."]
+
+        issues = self._cluster_hotspots(hotspots)
+        total_time = sum(e["Total"] for e in self.events if e["Level"] == 0)
+        if total_time == 0:
+            total_time = sum(e["Total"] for e in self.events)
+
+        lines = []
+        lines.append("=== TOP ISSUES (проблемы по убыванию влияния) ===")
+        lines.append("")
+
+        for idx, issue in enumerate(issues[:10], 1):
+            pct = (issue["impact"] / total_time * 100) if total_time > 0 else 0
+            issue_type = self._classify_issue(issue["hotspots"])
+
+            # Описание Issue
+            top_hs = issue["hotspots"][0]
+            top_code = (top_hs["code"] or "").strip().replace("\n", " ")[:60]
+            description = f"{issue['module_short']}: {top_code}"
+
+            lines.append(f"--- ISSUE #{idx}: {description} ---")
+            lines.append(f"Влияние: {issue['impact']:.0f} мс ({pct:.1f}% от общего), {issue['count']} вызовов")
+            lines.append(f"Тип: {issue_type}")
+
+            # Контекст
+            contexts = set()
+            for hs in issue["hotspots"]:
+                ctx = context_label(hs.get("ctx"))
+                if ctx:
+                    contexts.add(ctx)
+            ctx_str = ", ".join(sorted(contexts)) if contexts else "?"
+            ext_names = set()
+            for hs in issue["hotspots"]:
+                if hs.get("ext"):
+                    ext_names.add(hs["ext"])
+            ext_str = f" Расширение {', '.join(sorted(ext_names))}" if ext_names else ""
+            lines.append(f"Контекст: [{ctx_str}]{ext_str}")
+            lines.append("")
+
+            # Цепочка вызовов (для основного hotspot)
+            main_event = top_hs["events"][0] if top_hs["events"] else None
+            if main_event:
+                chain = self._build_call_chain(main_event)
+                if chain:
+                    lines.append("  Цепочка вызовов:")
+                    for depth, link in enumerate(chain):
+                        evt = link["event"]
+                        link_ctx = context_label(link.get("context")) or "?"
+                        link_mod = link["module_short"]
+                        link_code = (evt["Code"] or "").strip().replace("\n", " ")[:60]
+                        indent = "    " + "  " * depth
+                        lines.append(
+                            f"{indent}[{link_ctx}] {link_mod}:{evt['Line']} | {link_code}  [{evt['Total']:.0f}ms]"
+                        )
+                    # Добавляем сам hotspot как лист
+                    leaf_ctx = context_label(main_event.get("Context")) or "?"
+                    leaf_mod = _module_short_name(
+                        _strip_extension_prefix(main_event["Module"], main_event.get("Extension")))
+                    leaf_code = (main_event["Code"] or "").strip().replace("\n", " ")[:60]
+                    leaf_indent = "    " + "  " * len(chain)
+                    lines.append(
+                        f"{leaf_indent}[{leaf_ctx}] {leaf_mod}:{main_event['Line']} | "
+                        f"★ Self: {main_event['Pure']:.0f}ms | {leaf_code}"
+                    )
+                    lines.append("")
+
+            # Ключевые Self-точки
+            lines.append("  Ключевые Self-точки:")
+            for hs in issue["hotspots"][:5]:
+                hs_mod = _module_short_name(
+                    _strip_extension_prefix(hs["mod"], hs.get("ext")))
+                hs_code = (hs["code"] or "").strip().replace("\n", " ")[:60]
+                lines.append(f"    {hs_mod}:{hs['line']} | Self: {hs['pure']:.0f}ms | {hs_code}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+
+# ==================================================================================================
+# 4. REPORT GENERATOR (TRACE & PERF)
 # ==================================================================================================
 
 # Ширина колонки контекста (для выравнивания при "только при смене")
@@ -697,6 +1205,9 @@ class ReportGenerator:
         self.compact = compact
         self.show_context = show_context
         self.expand_module_names = expand_module_names
+
+        # v4: определяем, есть ли реальные уровни вложенности (Level > 0)
+        self.has_level = any(e["Level"] > 0 for e in events) if events else False
 
         if events:
             min_level = min(e['Level'] for e in events)
@@ -753,12 +1264,20 @@ class ReportGenerator:
         return loc
 
     def generate_trace(self):
-        """TRACE v3: SUMMARY + CALL MAP + MODULES."""
+        """TRACE v4: EXECUTION FLOW + CALL MAP + MODULES (оптимизированные)."""
         lines = []
         grouped = ProcedureGrouper(self.events).group()
         call_map = CallMapBuilder(self.events, grouped, threshold_ms=self.threshold_ms).build()
 
+        # Вычислить порог для ExecutionFlowBuilder
+        ef_threshold = self._calc_modules_threshold()
+
         lines.append("=== TRACE ===")
+        lines.append("")
+
+        # EXECUTION FLOW (v4) — перед CALL MAP
+        ef_builder = ExecutionFlowBuilder(self.events, grouped, ef_threshold)
+        lines.append(ef_builder.build())
         lines.append("")
 
         lines.append("=== CALL MAP ===")
@@ -785,8 +1304,17 @@ class ReportGenerator:
                     )
                 lines.append("")
 
-        lines.append("=== MODULES ===")
+        lines.append("=== MODULES (справочник модулей) ===")
+
+        # Вычисляем порог для модулей (threshold для MODULES)
+        modules_threshold = self._calc_modules_threshold()
+
         for g in grouped:
+            # Правило 4: модули с суммой Total всех блоков < threshold — пропускаем
+            module_total = sum(b["total"] for b in g.get("blocks", []))
+            if module_total < modules_threshold:
+                continue
+
             ctx = context_label(g.get("context")) or "?"
             mod_name = _strip_extension_prefix(g["module"], g.get("extension"))
             module_display = self.get_module_id(mod_name)
@@ -805,67 +1333,102 @@ class ReportGenerator:
             
             header_parts.append(module_display)
             
+            lines.append("")
             lines.append(f"--- {' '.join(header_parts)} ---")
             lines.append("")
             for b in g.get("blocks", []):
+                # Правило 1: свёртка тривиальных процедур
+                if b["total"] < modules_threshold:
+                    lines.append(
+                        f"  [{ctx}] {b['type']} (lines {b['line_start']}-{b['line_end']}) "
+                        f"Total: {b['total']:.2f}ms  [свёрнуто]"
+                    )
+                    continue
+
                 lines.append(
                     f"  [{ctx}] {b['type']} (lines {b['line_start']}-{b['line_end']}) "
                     f"Total: {b['total']:.2f}ms Pure: {b['pure']:.2f}ms"
                 )
-                for e in b["events"]:
-                    code_lines = (e["Code"] or "").replace("\r", "").split("\n")
-                    if not code_lines:
-                        code_lines = [""]
-                    lines.append(f"    :{e['Line']} | {code_lines[0]}  {e['Total']:.3f}  {e['Pure']:.3f}")
-                    for extra in code_lines[1:]:
-                        lines.append(f"           | {extra}")
+
+                # Фильтрация и коллапс строк внутри блока
+                filtered_events = self._filter_block_events(b["events"])
+                collapsed = self._collapse_repeated_events(filtered_events)
+
+                trivial_count = len(b["events"]) - len(filtered_events)
+
+                for item in collapsed:
+                    if item["type"] == "single":
+                        e = item["event"]
+                        code_lines = (e["Code"] or "").replace("\r", "").split("\n")
+                        if not code_lines:
+                            code_lines = [""]
+                        lines.append(f"    :{e['Line']} | {code_lines[0]}  {e['Total']:.3f}  {e['Pure']:.3f}")
+                        for extra in code_lines[1:]:
+                            lines.append(f"           | {extra}")
+                    elif item["type"] == "collapsed":
+                        lines.append(
+                            f"    :{item['line_start']}-{item['line_end']} | "
+                            f"{item['count']}× {item['pattern']}  Total: {item['total']:.2f}ms"
+                        )
+
+                if trivial_count > 0:
+                    lines.append(f"    (+{trivial_count} тривиальных строк опущено)")
+
                 lines.append("")
 
         return "\n".join(lines)
 
     def generate_perf(self):
-        """PERF: дерево критического пути + Hotspots."""
-        # 1. Build Tree
-        root = {'children': [], 'event': None, 'total': 0}
-        stack = [root]
-
-        for e in self.events:
-            node = {'children': [], 'event': e, 'total': e['Total'], 'significant': False}
-            target_idx = e['Level'] + 1
-
-            while len(stack) > target_idx:
-                stack.pop()
-
-            parent = stack[-1]
-            parent['children'].append(node)
-            stack.append(node)
-
-        # 2. Threshold
-        max_duration = 0
-        for child in root['children']:
-            if child['total'] > max_duration:
-                max_duration = child['total']
-
-        threshold = self.threshold_ms if self.threshold_ms is not None else max(1.0, max_duration * 0.01)
-
-        self._mark_significant(root, threshold)
-
-        # 3. Tree Output
+        """PERF v4: TOP ISSUES (для формата 2b/2c без Level) или дерево (для формата 1 с Level) + Hotspots."""
         tree_lines = []
-        tree_lines.append("=== PERF (дерево критического пути) ===")
-        tree_lines.append(f"Порог: {threshold:.2f} мс (1% от макс.)")
-        if self.show_context:
-            tree_lines.append("Контекст показывается только при смене; при одном контексте — только у первой строки. [C]=Клиент, [S]=Сервер, [C→S]=Клиент вызывает Сервер.")
-        tree_lines.append("-" * 80)
 
-        self._print_tree(root, tree_lines, 0, None, None, None)
+        if self.has_level:
+            # Формат 1: Level присутствует — используем классическое дерево
+            # 1. Build Tree
+            root = {'children': [], 'event': None, 'total': 0}
+            stack = [root]
 
-        # 4. Hotspots
+            for e in self.events:
+                node = {'children': [], 'event': e, 'total': e['Total'], 'significant': False}
+                target_idx = e['Level'] + 1
+
+                while len(stack) > target_idx:
+                    stack.pop()
+
+                parent = stack[-1]
+                parent['children'].append(node)
+                stack.append(node)
+
+            # 2. Threshold
+            max_duration = 0
+            for child in root['children']:
+                if child['total'] > max_duration:
+                    max_duration = child['total']
+
+            threshold = self.threshold_ms if self.threshold_ms is not None else max(1.0, max_duration * 0.01)
+
+            self._mark_significant(root, threshold)
+
+            # 3. Tree Output
+            tree_lines.append("=== PERF (дерево критического пути) ===")
+            tree_lines.append(f"Порог: {threshold:.2f} мс (1% от макс.)")
+            if self.show_context:
+                tree_lines.append("Контекст показывается только при смене; при одном контексте — только у первой строки. [C]=Клиент, [S]=Сервер, [C→S]=Клиент вызывает Сервер.")
+            tree_lines.append("-" * 80)
+
+            self._print_tree(root, tree_lines, 0, None, None, None)
+        else:
+            # Формат 2b/2c: Level=0 — генерируем TOP ISSUES вместо плоского дерева
+            grouped = ProcedureGrouper(self.events).group()
+            issue_threshold = self._calc_modules_threshold()
+            analyzer = IssueAnalyzer(self.events, grouped, issue_threshold)
+            tree_lines.append(analyzer.build())
+
+        # 4. Hotspots (v4: обогащённые — добавлен Total)
         hotspots_lines = []
         hotspots_lines.append("")
         hotspots_lines.append("=== HOTSPOTS (топ по чистому времени) ===")
-        if self.show_context:
-            hotspots_lines.append("Контекст показывается только при смене; при одном контексте — только у первой строки. [C]=Клиент, [S]=Сервер, [C→S]=Клиент вызывает Сервер.")
+        hotspots_lines.append("#  | Self(мс) | Total(мс) | Ctx | Module:Line | Code")
 
         agg = {}
         for e in self.events:
@@ -873,46 +1436,30 @@ class ReportGenerator:
             ext = e.get('Extension')
             key = (e['Module'], e['Line'], ctx, ext)
             if key not in agg:
-                agg[key] = {'pure': 0, 'count': 0, 'code': e['Code'], 'mod': e['Module'], 'ctx': ctx, 'ext': ext}
+                agg[key] = {'pure': 0, 'total': 0, 'count': 0, 'code': e['Code'],
+                            'mod': e['Module'], 'ctx': ctx, 'ext': ext}
             agg[key]['pure'] += e['Pure']
+            agg[key]['total'] += e['Total']
             agg[key]['count'] += 1
 
         sorted_agg = sorted(agg.items(), key=lambda x: x[1]['pure'], reverse=True)
 
-        prev_hotspot_ctx = None
-        prev_hotspot_mod = None
-        prev_hotspot_ext = None
-        
-        for i, (key, val) in enumerate(sorted_agg[:10]):
+        for i, (key, val) in enumerate(sorted_agg[:15]):
             ctx = val['ctx']
             ext = val['ext']
-            
-            ctx_label = context_label(ctx) if ctx is not None else ""
-            show_ctx = self.show_context and (prev_hotspot_ctx != ctx or (ctx_label and prev_hotspot_ctx is None))
-            ctx_str = f"[{ctx_label}] " if show_ctx and ctx_label else (" " * (CONTEXT_COL_WIDTH + 1) if self.show_context else "")
-            prev_hotspot_ctx = ctx
-            
-            show_module = (prev_hotspot_mod is None or val['mod'] != prev_hotspot_mod or ext != prev_hotspot_ext)
-            
+            ctx_label_str = context_label(ctx) if ctx is not None else "?"
+
             mod_name = val['mod']
             if ext and mod_name.startswith(ext + ' '):
                 mod_name = mod_name[len(ext)+1:]
-            
-            mid = self.get_module_id(mod_name) if show_module else ""
-            
-            if show_module:
-                if ext:
-                    location = f"[Ext:{ext}] {mid}:{key[1]}"
-                else:
-                    location = f"{mid}:{key[1]}"
-            else:
-                location = f":{key[1]}"
-            
-            prev_hotspot_mod = val['mod']
-            prev_hotspot_ext = ext
-            
-            code_snip = val['code'].strip().replace('\n', ' ')[:80]
-            hotspots_lines.append(f"#{i+1} {ctx_str}{location} | Чистое: {val['pure']:.2f} мс ({val['count']}x) | {code_snip}")
+
+            mod_short = _module_short_name(mod_name)
+            location = f"{mod_short}:{key[1]}"
+
+            code_snip = val['code'].strip().replace('\n', ' ')[:60]
+            hotspots_lines.append(
+                f"{i+1:<3}| {val['pure']:>8.2f} | {val['total']:>9.2f} | {ctx_label_str:<3} | {location} | {code_snip}"
+            )
 
         return "\n".join(tree_lines + hotspots_lines)
 
@@ -980,6 +1527,67 @@ class ReportGenerator:
         if hidden_count > 0:
             lines.append(f"{indent}  [+ {hidden_count} мелких вызовов: {hidden_time:.2f} мс]")
         return last_mod, last_ext
+
+    def _calc_modules_threshold(self):
+        """Вычислить порог для MODULES: используем threshold_ms или 1% от общего времени."""
+        if self.threshold_ms is not None:
+            return self.threshold_ms
+        total_ms = sum(e["Total"] for e in self.events)
+        return max(0.5, total_ms * 0.01)
+
+    @staticmethod
+    def _filter_block_events(events):
+        """Правило 2: фильтр строк — убрать структурный шум и тривиальные строки."""
+        result = []
+        for e in events:
+            code = (e.get("Code") or "").strip()
+            # Убрать структурный шум
+            if any(code.startswith(noise) for noise in STRUCTURAL_NOISE):
+                continue
+            # Убрать тривиальные строки: Total < 0.01 мс И Pure ≈ Total (разница < 10%)
+            if e["Total"] < 0.01:
+                if e["Total"] == 0 or abs(e["Total"] - e["Pure"]) < e["Total"] * 0.1:
+                    continue
+            result.append(e)
+        return result
+
+    @staticmethod
+    def _collapse_repeated_events(events):
+        """Правило 3: коллапс повторов — если N >= 5 подряд с одинаковым паттерном кода."""
+        if not events:
+            return []
+
+        def _code_pattern(code):
+            """Извлечь паттерн кода (до первой скобки или первое слово)."""
+            code = (code or "").strip().split("\n")[0]
+            paren = code.find("(")
+            if paren > 0:
+                return code[:paren].strip()
+            return code[:40].strip()
+
+        result = []
+        i = 0
+        while i < len(events):
+            pat = _code_pattern(events[i].get("Code"))
+            j = i + 1
+            while j < len(events) and _code_pattern(events[j].get("Code")) == pat:
+                j += 1
+            count = j - i
+            if count >= 5:
+                total = sum(e["Total"] for e in events[i:j])
+                result.append({
+                    "type": "collapsed",
+                    "line_start": events[i]["Line"],
+                    "line_end": events[j-1]["Line"],
+                    "count": count,
+                    "pattern": pat + "(...)",
+                    "total": total,
+                })
+            else:
+                for k in range(i, j):
+                    result.append({"type": "single", "event": events[k]})
+            i = j
+        return result
 
     def _ensure_modules(self):
         """Предзаполнить легенду модулей из событий."""

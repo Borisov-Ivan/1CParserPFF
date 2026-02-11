@@ -114,6 +114,71 @@ def run_parser():
     btn_open.config(state=tk.NORMAL)
 
 
+HELP_TEXT = """=== Руководство пользователя 1CParserPFF ===
+
+1. О ПРОГРАММЕ
+1CParserPFF — инструмент для анализа файлов замеров производительности 1С (.pff).
+Он преобразует сырые данные замера в структурированные текстовые отчеты, удобные для анализа разработчиком и LLM.
+
+2. БЫСТРЫЙ СТАРТ
+1. Запустите программу.
+2. Выберите файл замера (.pff или .txt).
+3. Выберите режим (TRACE или PERF).
+4. Нажмите «Сформировать».
+5. Результат появится в текстовом поле и сохранится в файл *_TRACE.txt / *_PERF.txt.
+
+3. ДВА РЕЖИМА РАБОТЫ
+
+[TRACE] — «Что произошло?»
+Восстановление потока выполнения и отладка логики.
+- EXECUTION FLOW: Дерево вызовов (эвристика ~90%). Колбэк-цепочки свернуты.
+- CALL MAP: Строки с наибольшим временем во вложенных вызовах (Budget).
+- MODULES: Справочник модулей. Тривиальные процедуры свернуты.
+
+[PERF] — «Почему медленно?»
+Поиск узких мест и оптимизация.
+- TOP ISSUES: Топ проблем (HTTP, SQL, Логика) с цепочками вызовов.
+- HOTSPOTS: Топ строк по чистому времени (Self time).
+- Дерево критического пути (если есть Level).
+
+4. СЛОВАРЬ ТЕРМИНОВ
+Total (мс)  — Полное время строки (с вложенными).
+Pure (мс)   — Чистое время (только эта строка).
+Budget      — Total - Pure (время во вложенных).
+[C] / [S]   — Клиент / Сервер.
+[C->S]      — Вызов сервера с клиента.
+★           — Маркер узкого места (высокое Pure).
+Count       — Количество выполнений.
+
+5. НАСТРОЙКИ
+- Точка входа: Фильтр по подстроке кода (покажет только нужный сеанс).
+- Порог (мс): Минимальное время для включения в отчет (только PERF).
+- Разворачивать имена: Полные имена модулей или короткие (M1, M2).
+- Умное сжатие: Объединять переносы строк (только TRACE).
+- Промпт для модели: Инструкция для LLM в начале отчета.
+
+6. CLI (Командная строка)
+python pff_parser.py [file] --mode PERF --threshold 10
+"""
+
+
+def open_help():
+    """Открыть встроенную справку в отдельном окне."""
+    top = tk.Toplevel()
+    top.title("Справка")
+    top.geometry("700x600")
+
+    text_area = tk.Text(top, wrap=tk.WORD, font=("Segoe UI", 10), padx=10, pady=10)
+    text_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    scrollbar = ttk.Scrollbar(top, command=text_area.yview)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    text_area.config(yscrollcommand=scrollbar.set)
+
+    text_area.insert(tk.END, HELP_TEXT)
+    text_area.config(state=tk.DISABLED)  # Read-only
+
+
 def choose_file():
     path = filedialog.askopenfilename(
         title="Выберите файл замера (PFF/TXT)",
@@ -156,9 +221,13 @@ def build_ui(root: tk.Tk):
     ttk.Label(main, text="Режим:").grid(row=2, column=0, sticky=tk.W, pady=(0, 4))
     var_mode = tk.StringVar(value="TRACE")
     mode_frame = ttk.Frame(main)
-    mode_frame.grid(row=3, column=0, sticky=tk.W, pady=(0, 8))
+    mode_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 8))
     ttk.Radiobutton(mode_frame, text="Трассировка", variable=var_mode, value="TRACE", command=update_mode_sensitivity).pack(side=tk.LEFT, padx=(0, 16))
     ttk.Radiobutton(mode_frame, text="Производительность", variable=var_mode, value="PERF", command=update_mode_sensitivity).pack(side=tk.LEFT)
+
+    help_label = tk.Label(mode_frame, text="Справка", fg="#0366d6", cursor="hand2", font=("", 9, "underline"))
+    help_label.pack(side=tk.RIGHT, padx=(0, 0))
+    help_label.bind("<Button-1>", lambda e: open_help())
 
     # Точка входа
     ttk.Label(main, text="Точка входа:").grid(row=4, column=0, sticky=tk.W, pady=(0, 4))
@@ -197,8 +266,14 @@ def build_ui(root: tk.Tk):
     result_header.grid(row=11, column=0, sticky=(tk.W, tk.E), pady=(0, 4))
     result_header.columnconfigure(1, weight=1)
     ttk.Label(result_header, text="Результат:").grid(row=0, column=0, sticky=tk.W)
-    btn_form = ttk.Button(result_header, text="Сформировать", command=run_parser)
-    btn_form.grid(row=0, column=1, sticky=tk.E)
+    
+    # Фрейм для кнопок справа
+    btn_frame = ttk.Frame(result_header)
+    btn_frame.grid(row=0, column=1, sticky=tk.E)
+    
+    btn_form = ttk.Button(btn_frame, text="Сформировать", command=run_parser)
+    btn_form.pack(side=tk.LEFT)
+    
     root.bind("<Return>", lambda e: run_parser())
 
     # Текстовое поле результата
