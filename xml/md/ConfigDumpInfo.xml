@@ -1,0 +1,17 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<ConfigDumpInfo xmlns="http://v8.1c.ru/8.3/xcf/dumpinfo" xmlns:xen="http://v8.1c.ru/8.3/xcf/enums" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" format="Hierarchical" version="2.20">
+	<ConfigVersions>
+		<Metadata name="CommonModule.Клиент" id="38ae6f03-1f72-4de0-a3f7-95486719a55c" configVersion="670cc65fe8b76542928254870be10c9800000000"/>
+		<Metadata name="CommonModule.Клиент.Module" id="38ae6f03-1f72-4de0-a3f7-95486719a55c.0" configVersion="3ab9eb1aa039e84486675aa86a1693cc00000000"/>
+		<Metadata name="CommonModule.КлиентСервер" id="b2bf1754-8f5b-4ba9-a9a2-0e5f8df674bd" configVersion="8c9fdc790bc84a4bb12fe6ccc2acd4cc00000000"/>
+		<Metadata name="CommonModule.КлиентСервер.Module" id="b2bf1754-8f5b-4ba9-a9a2-0e5f8df674bd.0" configVersion="d28f25f3c1b31b409cb47a9599d2ad1700000000"/>
+		<Metadata name="CommonModule.Сервер" id="34875012-eaba-457f-aba1-9f768d586b8f" configVersion="5d6bbb9462d4bd418fad0bdc86c6544900000000"/>
+		<Metadata name="CommonModule.Сервер.Module" id="34875012-eaba-457f-aba1-9f768d586b8f.0" configVersion="71b1b24c26591c46a657609e85d7771b00000000"/>
+		<Metadata name="Configuration.Конфигурация" id="ac369e19-bd6b-45ce-9426-e6675ac22eea" configVersion="19594ebeaf59ff45b5c3be62db8935a800000000"/>
+		<Metadata name="DataProcessor.ОбработкаТест" id="384d47b7-d2a9-414a-bde3-0729d0b47d75" configVersion="366d414c254bb342a76662ff48efc98a00000000"/>
+		<Metadata name="DataProcessor.ОбработкаТест.Form.Форма" id="f3ed3be1-8675-4a57-b0f5-c4a28507ca05" configVersion="cc8f76979a9e83428c93148b79bba78300000000"/>
+		<Metadata name="DataProcessor.ОбработкаТест.Form.Форма.Form" id="f3ed3be1-8675-4a57-b0f5-c4a28507ca05.0" configVersion="9e14a6f9d0128f4d83dc3485b7f4b01800000000"/>
+		<Metadata name="Language.Русский" id="d9c3e325-be8a-40cc-b192-cb7e1e793ddf" configVersion="563c498a5f52964094abd68b1950220b00000000"/>
+		<Metadata name="ScheduledJob.РегламентноеЗадание" id="e58d63e6-8ccc-4dc0-9971-1c3bb202466f" configVersion="2c83355bd3bf82439a82b0ee42c4da2600000000"/>
+	</ConfigVersions>
+</ConfigDumpInfo>

@@ -1,0 +1,11 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<ConfigDumpInfo xmlns="http://v8.1c.ru/8.3/xcf/dumpinfo" xmlns:xen="http://v8.1c.ru/8.3/xcf/enums" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" format="Hierarchical" version="2.20">
+	<ConfigVersions>
+		<Metadata name="Configuration.РасширениеТест" id="fb037f49-f055-44ef-ac06-299352089699" configVersion="5cf8411f4b0495f5fd858a5e320b0164df94e37f"/>
+		<Metadata name="DataProcessor.ОбработкаТест" id="1e71e224-6476-4cb3-80b5-1657a93d3197" configVersion="884f95b89aea79bae49e4675e8898b514ff26d38"/>
+		<Metadata name="DataProcessor.ОбработкаТест.Form.Форма" id="22ce617a-5887-4091-a5dc-69a2250db758" configVersion="45429e2454c729949ff3fa2f01b179e62ab2e1ce"/>
+		<Metadata name="DataProcessor.ОбработкаТест.Form.Форма.Form" id="22ce617a-5887-4091-a5dc-69a2250db758.0" configVersion="685b6a1ee617ce870a1c39379c99352d9e8d2563"/>
+		<Metadata name="Language.Русский" id="20ef521e-7e0a-4714-ba4a-cfbe099eaa37" configVersion="5628e1d381382413df28241e9c92a1dbd0476059"/>
+		<Metadata name="Role.тест_ОсновнаяРоль" id="0657a355-bf36-40b0-a3cb-b1fde6974dec" configVersion="22fddf934728188d8c0607191ab1fc8ce8bd416d"/>
+	</ConfigVersions>
+</ConfigDumpInfo>
