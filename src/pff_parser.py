@@ -25,13 +25,20 @@ CONTEXT_LABELS = {
     3: 'C→S', 4: 'C→S', 5: 'C→S', 6: 'C→S',
 }
 
+SESSION_TYPES = {
+    2: "Сервер",
+    32: "Тонкий клиент",
+    64: "Сервер",
+}
+
 # Промпты для модели в заголовке отчёта (при включённой опции на форме)
 TRACE_MODEL_PROMPT = """=== ПРОМПТ ДЛЯ МОДЕЛИ (TRACE) ===
 Ты анализируешь отчёт трассировки выполнения 1С (PFF TRACE).
 
 Правила работы с файлом:
 - TRACE содержит три секции: SUMMARY, CALL MAP, MODULES.
-- В MODULES данные сгруппированы по (модуль + контекст + расширение).
+- В MODULES данные сгруппированы по (модуль + контекст + расширение + блок).
+- Блоки соответствуют сессиям (например, B0 [Сервер] ...).
 - Блоки вида [S] Func (lines X-Y) или [C] Proc (lines X-Y) — это идентификаторы диапазонов строк; имена процедур в PFF обычно отсутствуют.
 - Внутри блока каждая строка: :Line | Code  Total  Pure (мс).
 - В CALL MAP показываются строки, где Budget = Total - Pure > threshold. Это индикатор времени, ушедшего во вложенные вызовы.
@@ -59,6 +66,7 @@ PERF_MODEL_PROMPT = """=== ПРОМПТ ДЛЯ МОДЕЛИ (PERF) ===
 - Сопоставляй узлы дерева с HOTSPOTS: высокое «Всего» при малом «Чистое» — время во вложенных вызовах; высокое «Чистое» — узкое место в самом узле.
 - Контекст [C]/[S]/[C→S] при смене помогает отделять клиентскую и серверную нагрузку. [C→S] — выполнение на сервере (Обр. сервером). [?] — неизвестное значение контекста в PFF.
 - Для строк только с «:Строка» определяй модуль по последней выше стоящей строке с полным именем модуля.
+- ВНИМАНИЕ: Дерево PERF может быть неточным для замеров формата 2c (реальные замеры) из-за отсутствия явного уровня вложенности (Level). Требуется дополнительная верификация по TRACE.
 
 === КОНЕЦ ПРОМПТА ===
 """
@@ -135,6 +143,7 @@ class PFFStreamParser:
         self.content = content
         self.length = len(content)
         self.pos = 0
+        self.session_info = {}
 
     def parse_events(self):
         """
@@ -161,6 +170,15 @@ class PFFStreamParser:
             record_fields = self._read_record_fields()
 
             if len(record_fields) > 0:
+                # Заголовок сеанса (Type=10)
+                if record_fields[0] == 10 and len(record_fields) > 5:
+                    self.session_info[block_id] = {
+                        "host": record_fields[1],
+                        "session_id": record_fields[3],
+                        "app_type": record_fields[5],
+                    }
+                    continue
+
                 # Формат 2a: единственное поле — блок {0, ticks, GUID, {внутренние записи}}
                 if len(record_fields) == 1 and isinstance(record_fields[0], str):
                     blk = record_fields[0].strip()
@@ -198,7 +216,7 @@ class PFFStreamParser:
                             try:
                                 evt = self._fields_to_event(
                                     record_fields, base + 1, base + 2, base + 3,
-                                    base + 5, base + 6, base + 9, sig_idx=base
+                                    base + 5, base + 6, sig_idx=base
                                 )
                                 # В 2c (flattened 2b) контекст хранится тремя флагами (Клиент/Сервер/Обработка).
                                 if base + 11 < len(record_fields):
@@ -478,6 +496,7 @@ def resolve_entry(events, entry_spec):
     """Найти событие по entry_spec: 'Module:Line' или подстрока кода."""
     if not entry_spec:
         return None
+    # 1. Попробовать Module:Line
     if ':' in entry_spec and not entry_spec.startswith('"'):
         parts = entry_spec.rsplit(':', 1)
         if len(parts) == 2:
@@ -489,40 +508,11 @@ def resolve_entry(events, entry_spec):
                         return e
             except ValueError:
                 pass
-    else:
-        for e in events:
-            if entry_spec in e.get('Code', ''):
-                return e
+    # 2. Всегда fallback на поиск по подстроке кода
+    for e in events:
+        if entry_spec in e.get('Code', ''):
+            return e
     return None
-
-
-def filter_by_entry(events, entry_spec):
-    """
-    Оставить только поддерево точки входа.
-    Поддерево = entry + все события после него с Level > entry.Level до первого Level <= entry.Level.
-    """
-    if not entry_spec:
-        return events
-    entry_event = resolve_entry(events, entry_spec)
-    if not entry_event:
-        return events
-
-    # Найти индекс entry (по ссылке на объект)
-    idx = None
-    for i, e in enumerate(events):
-        if e is entry_event:
-            idx = i
-            break
-    if idx is None:
-        return events
-
-    entry_level = entry_event['Level']
-    result = [events[idx]]
-    for j in range(idx + 1, len(events)):
-        if events[j]['Level'] <= entry_level:
-            break
-        result.append(events[j])
-    return result
 
 
 def filter_by_main_block(events, main_block):
@@ -530,23 +520,6 @@ def filter_by_main_block(events, main_block):
     if main_block is None:
         return events
     return [e for e in events if e.get('block_id', 0) == main_block]
-
-
-def classify_block(events, block_id):
-    """
-    Эвристика: под (подписчики) — мало L0, осн — много L0, смес — промежуточное.
-    """
-    block_events = [e for e in events if e.get('block_id') == block_id]
-    if not block_events:
-        return "неизв"
-    l0_count = sum(1 for e in block_events if e['Level'] == 0)
-    ratio = l0_count / len(block_events)
-    if ratio < 0.1:
-        return "под"
-    elif ratio > 0.5:
-        return "осн"
-    else:
-        return "смес"
 
 
 def _strip_extension_prefix(module_name, extension):
@@ -627,13 +600,14 @@ class ProcedureGrouper:
         groups = []
         index = {}
         for e in self.events:
-            key = (e["Module"], e.get("Context"), e.get("Extension"))
+            key = (e["Module"], e.get("Context"), e.get("Extension"), e.get("block_id", 0))
             if key not in index:
                 index[key] = len(groups)
                 groups.append({
                     "module": e["Module"],
                     "context": e.get("Context"),
                     "extension": e.get("Extension"),
+                    "block_id": e.get("block_id", 0),
                     "events": [],
                 })
             groups[index[key]]["events"].append(e)
@@ -713,8 +687,9 @@ CONTEXT_COL_WIDTH = 5  # "[C→S]" = 5 символов
 
 
 class ReportGenerator:
-    def __init__(self, events, threshold_ms=None, all_events=None, compact=True, show_context=True, expand_module_names=True):
+    def __init__(self, events, session_info=None, threshold_ms=None, all_events=None, compact=True, show_context=True, expand_module_names=True):
         self.events = events
+        self.session_info = session_info or {}
         self.all_events = all_events if all_events is not None else events
         self.modules_map = {}
         self.modules_list = []
@@ -783,27 +758,7 @@ class ReportGenerator:
         grouped = ProcedureGrouper(self.events).group()
         call_map = CallMapBuilder(self.events, grouped, threshold_ms=self.threshold_ms).build()
 
-        by_block_sec = {}
-        for e in self.events:
-            if "_block_total_sec" in e:
-                bid = e.get("block_id", 0)
-                if bid not in by_block_sec:
-                    by_block_sec[bid] = e["_block_total_sec"]
-        if by_block_sec:
-            total_time_ms = sum(by_block_sec.values()) * 1000.0
-        else:
-            total_time_ms = sum(e["Total"] for e in self.events if e.get("Level", 0) == 0)
-        if total_time_ms <= 0:
-            total_time_ms = sum(e["Total"] for e in self.events)
-
-        blocks_count = len(set(e.get("block_id", 0) for e in self.events))
-        contexts = sorted(set(context_label(e.get("Context")) or "?" for e in self.events))
-
         lines.append("=== TRACE ===")
-        lines.append("")
-        lines.append("=== SUMMARY ===")
-        lines.append(f"Events: {len(self.events)} | Blocks: {blocks_count} | Total: {total_time_ms/1000.0:.2f}s")
-        lines.append("Contexts: " + ", ".join(f"[{c}]" for c in contexts))
         lines.append("")
 
         lines.append("=== CALL MAP ===")
@@ -835,10 +790,22 @@ class ReportGenerator:
             ctx = context_label(g.get("context")) or "?"
             mod_name = _strip_extension_prefix(g["module"], g.get("extension"))
             module_display = self.get_module_id(mod_name)
+            
+            bid = g.get("block_id", 0)
+            si = self.session_info.get(bid, {})
+            app_type = si.get("app_type")
+            app_label = SESSION_TYPES.get(app_type, f"Тип {app_type}") if app_type else ""
+            
+            header_parts = []
+            if app_label:
+                header_parts.append(f"B{bid} [{app_label}]")
+            
             if g.get("extension"):
-                lines.append(f"--- [Ext:{g['extension']}] {module_display} ---")
-            else:
-                lines.append(f"--- {module_display} ---")
+                header_parts.append(f"[Ext:{g['extension']}]")
+            
+            header_parts.append(module_display)
+            
+            lines.append(f"--- {' '.join(header_parts)} ---")
             lines.append("")
             for b in g.get("blocks", []):
                 lines.append(
@@ -1028,7 +995,7 @@ class ReportGenerator:
                 exts.add(ext)
         return sorted(exts)
 
-    def get_full_report(self, entry_info="all", blocks_info="", include_trace=True, include_perf=True, include_hotspots=True, include_model_prompt=True):
+    def get_full_report(self, entry_info="all", blocks_info="", mode="TRACE", include_model_prompt=True):
         parts = []
         self._ensure_modules()
 
@@ -1046,13 +1013,19 @@ class ReportGenerator:
             parts.append("")
 
         # Modules (только при коротких именах M1, M2)
-        parts.append("=== МОДУЛИ ===")
-        if not self.expand_module_names and self.modules_list:
-            parts.extend(self.modules_list)
-        parts.append("")
+        if mode == "TRACE":
+             parts.append("=== МОДУЛИ ===")
+             if not self.expand_module_names and self.modules_list:
+                 parts.extend(self.modules_list)
+             elif self.expand_module_names:
+                 parts.pop() # Remove header if empty
+             else:
+                 parts.append("(пусто)")
+             if parts and parts[-1] != "":
+                parts.append("")
 
         # Trace
-        if include_trace:
+        if mode == "TRACE":
             if include_model_prompt:
                 parts.append(TRACE_MODEL_PROMPT.strip())
                 parts.append("")
@@ -1060,7 +1033,7 @@ class ReportGenerator:
             parts.append("")
 
         # Perf + Hotspots
-        if include_perf or include_hotspots:
+        if mode == "PERF":
             if include_model_prompt:
                 parts.append(PERF_MODEL_PROMPT.strip())
                 parts.append("")
@@ -1074,7 +1047,7 @@ class ReportGenerator:
 # ==================================================================================================
 
 def process_pff(file_path, entry=None, main_block=None,
-                threshold_ms=None, no_perf=False, perf_only=False, no_hotspots=False, no_compact=False,
+                threshold_ms=None, mode="TRACE", no_compact=False,
                 no_context=False, expand_module_names=True, include_model_prompt=True):
     if not os.path.exists(file_path):
         return "File not found."
@@ -1084,6 +1057,7 @@ def process_pff(file_path, entry=None, main_block=None,
 
     parser = PFFStreamParser(content)
     all_evts = list(parser.parse_events())
+    session_info = parser.session_info
 
     if not all_evts:
         return "No trace events found in file."
@@ -1108,16 +1082,22 @@ def process_pff(file_path, entry=None, main_block=None,
             blocks_info = f"{num_blocks} блоков, точка входа не найдена ({len(events)} соб.)"
     elif main_block is not None:
         events = filter_by_main_block(all_evts, main_block)
-        bt = classify_block(all_evts, main_block)
-        blocks_info = f"{num_blocks} всего, B{main_block}: {len(events)} соб., {bt}"
+        si = session_info.get(main_block, {})
+        app_type = si.get("app_type")
+        label = SESSION_TYPES.get(app_type, f"Тип {app_type}") if app_type else "?"
+        host = si.get("host", "")
+        blocks_info = f"{num_blocks} всего, B{main_block}: {len(events)} соб., {label} ({host})"
         entry_info = f"блок {main_block}"
     elif num_blocks > 1:
         events = all_evts
         parts = []
         for bid in sorted(set(e.get('block_id', 0) for e in all_evts)):
             n = sum(1 for x in all_evts if x.get('block_id') == bid)
-            bt = classify_block(all_evts, bid)
-            parts.append(f"B{bid}: {n} соб., {bt}")
+            si = session_info.get(bid, {})
+            app_type = si.get("app_type")
+            label = SESSION_TYPES.get(app_type, f"Тип {app_type}") if app_type else "?"
+            host = si.get("host", "")
+            parts.append(f"B{bid}: {n} соб., {label} ({host})")
         blocks_info = " | ".join(parts)
         entry_info = "все"
     else:
@@ -1125,21 +1105,11 @@ def process_pff(file_path, entry=None, main_block=None,
         blocks_info = "1"
         entry_info = "все"
 
-    generator = ReportGenerator(events, threshold_ms, all_events=all_evts, compact=not no_compact, show_context=not no_context, expand_module_names=expand_module_names)
-    if perf_only:
-        include_trace = False
-        include_perf = True
-        include_hotspots = not no_hotspots
-    else:
-        include_trace = True
-        include_perf = not no_perf
-        include_hotspots = not no_hotspots
+    generator = ReportGenerator(events, session_info=session_info, threshold_ms=threshold_ms, all_events=all_evts, compact=not no_compact, show_context=not no_context, expand_module_names=expand_module_names)
     return generator.get_full_report(
         entry_info=entry_info,
         blocks_info=blocks_info,
-        include_trace=include_trace,
-        include_perf=include_perf,
-        include_hotspots=include_hotspots,
+        mode=mode,
         include_model_prompt=include_model_prompt
     )
 
@@ -1155,10 +1125,8 @@ def main():
                         help="Показать только блок N (0, 1, 2...). По умолчанию — все блоки")
     parser.add_argument("--threshold", type=float, default=None,
                         help="Порог значимости (ms). По умолчанию: 1%% от max")
-    parser.add_argument("--no-perf", action="store_true", help="Только TRACE")
-    parser.add_argument("--perf-only", action="store_true",
-                        help="Только PERF (без TRACE): дерево критического пути + Hotspots")
-    parser.add_argument("--no-hotspots", action="store_true", help="Без HOTSPOTS")
+    parser.add_argument("--mode", choices=["TRACE", "PERF"], default="TRACE",
+                        help="Режим: TRACE (трассировка) или PERF (производительность)")
     parser.add_argument("--no-compact", action="store_true",
                         help="Все события с полным префиксом (без объединения продолжений)")
     parser.add_argument("--no-context", action="store_true",
@@ -1170,7 +1138,10 @@ def main():
 
     args = parser.parse_args()
 
-    f_name = args.file or "Замер для исследований.pff.txt"
+    f_name = args.file
+    if not f_name:
+        print("Error: No file specified.")
+        return
     out_name = args.output
 
     report = process_pff(
@@ -1178,9 +1149,7 @@ def main():
         entry=args.entry,
         main_block=args.main_block,
         threshold_ms=args.threshold,
-        no_perf=args.no_perf,
-        perf_only=args.perf_only,
-        no_hotspots=args.no_hotspots,
+        mode=args.mode,
         no_compact=args.no_compact,
         no_context=args.no_context,
         expand_module_names=not args.no_expand_modules,
@@ -1192,7 +1161,7 @@ def main():
     except UnicodeEncodeError:
         sys.stdout.buffer.write((report + "\n").encode('utf-8'))
 
-    default_report_name = "PFF_Perf.txt" if args.perf_only else "PFF_Report.txt"
+    default_report_name = "PFF_Perf.txt" if args.mode == "PERF" else "PFF_Report.txt"
     out_path = out_name or os.path.join(os.path.dirname(f_name), default_report_name)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(report)
