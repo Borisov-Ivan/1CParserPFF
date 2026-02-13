@@ -13,6 +13,7 @@ import sys
 import os
 import argparse
 import re
+import shlex
 from collections import defaultdict
 
 # ==================================================================================================
@@ -105,6 +106,128 @@ PERF_MODEL_PROMPT = """=== ПРОМПТ ДЛЯ МОДЕЛИ (PERF) ===
 
 === КОНЕЦ ПРОМПТА ===
 """
+
+
+TRACE_FORMAT_VERSION = "TRACE v6"
+TRACE_FULL = "full"
+TRACE_NORMAL = "normal"
+TRACE_COMPACT = "compact"
+TRACE_DETAIL_CHOICES = (TRACE_FULL, TRACE_NORMAL, TRACE_COMPACT)
+
+TRACE_DETAIL_PROFILES = {
+    TRACE_FULL: {
+        "flow_base_factor": 0.0001,
+        "flow_target_rank": 500,
+        "flow_floor_ms": 0.1,
+        "modules_ratio": 0.10,
+        "modules_floor_ms": 0.1,
+        "control_multiplier": 0.20,
+        "call_map_min_items": 80,
+        "call_map_max_items": 360,
+        "call_map_target_coverage": 0.98,
+        "collapse_repeat_min_count": 999999,
+        "collapse_callback_min_chain": 999999,
+        "leaf_self_highlight_min_ms": 5.0,
+        "leaf_tiny_total_ms": 0.005,
+    },
+    TRACE_NORMAL: {
+        "flow_base_factor": 0.0004,
+        "flow_target_rank": 150,
+        "flow_floor_ms": 0.5,
+        "modules_ratio": 0.25,
+        "modules_floor_ms": 0.5,
+        "control_multiplier": 1.00,
+        "call_map_min_items": 60,
+        "call_map_max_items": 240,
+        "call_map_target_coverage": 0.90,
+        "collapse_repeat_min_count": 5,
+        "collapse_callback_min_chain": 3,
+        "leaf_self_highlight_min_ms": 10.0,
+        "leaf_tiny_total_ms": 0.010,
+    },
+    TRACE_COMPACT: {
+        "flow_base_factor": 0.0009,
+        "flow_target_rank": 90,
+        "flow_floor_ms": 1.0,
+        "modules_ratio": 0.75,
+        "modules_floor_ms": 1.0,
+        "control_multiplier": 1.60,
+        "call_map_min_items": 30,
+        "call_map_max_items": 120,
+        "call_map_target_coverage": 0.82,
+        "collapse_repeat_min_count": 3,
+        "collapse_callback_min_chain": 2,
+        "leaf_self_highlight_min_ms": 15.0,
+        "leaf_tiny_total_ms": 0.020,
+    },
+}
+
+TRACE_COVERAGE_REASON_KEYS = (
+    "structural_noise",
+    "control_leaf_noise",
+    "terminal_trivial",
+    "tiny_leaf",
+    "collapsed_repeats",
+    "collapsed_callbacks",
+    "threshold_hidden",
+)
+
+
+def normalize_trace_detail(value):
+    """Normalize trace_detail to one of full/normal/compact."""
+    if value is None:
+        return TRACE_NORMAL
+    normalized = str(value).strip().lower()
+    if normalized not in TRACE_DETAIL_CHOICES:
+        raise ValueError(
+            f"Unsupported trace detail '{value}'. "
+            f"Expected one of: {', '.join(TRACE_DETAIL_CHOICES)}."
+        )
+    return normalized
+
+
+def trace_detail_label(trace_detail):
+    return normalize_trace_detail(trace_detail).upper()
+
+
+def _coverage_counters():
+    return {key: 0 for key in TRACE_COVERAGE_REASON_KEYS}
+
+
+def _repro_cli_command(file_path, mode, trace_detail, entry=None, main_block=None,
+                       expand_module_names=True, include_model_prompt=True):
+    cmd = ["python", "src/pff_parser.py", file_path, "--mode", mode]
+    if mode == "TRACE":
+        cmd.extend(["--trace-detail", normalize_trace_detail(trace_detail)])
+    if entry:
+        cmd.extend(["--entry", entry])
+    if main_block is not None:
+        cmd.extend(["--main-block", str(main_block)])
+    if not expand_module_names:
+        cmd.append("--no-expand-modules")
+    if not include_model_prompt:
+        cmd.append("--no-model-prompt")
+    return " ".join(shlex.quote(str(part)) for part in cmd)
+
+
+def build_trace_model_prompt(trace_detail):
+    mode_label = trace_detail_label(trace_detail)
+    lines = [
+        f"=== ПРОМПТ ДЛЯ МОДЕЛИ (TRACE {mode_label}) ===",
+        f"Ты анализируешь отчёт {TRACE_FORMAT_VERSION} в режиме {mode_label}.",
+        "Обязательно ссылайся на EventID и Module:Line для каждого важного вывода.",
+        "Явно разделяй FACT (подтверждённые данные трассы) и INFERRED (эвристические связи).",
+        "В TRACE запрещено делать выводы о производительности по времени как KPI; для этого нужен PERF.",
+    ]
+    if normalize_trace_detail(trace_detail) == TRACE_FULL:
+        lines.append("Для локализации сценария учитывай фильтр entry/main-block из TRACE META.")
+    else:
+        lines.append("Если данных не хватает, эскалируй анализ до TRACE FULL с тем же фильтром.")
+    lines.extend([
+        "Используй TRACE COVERAGE, чтобы учитывать скрытые/свернутые элементы при выводах.",
+        "=== КОНЕЦ ПРОМПТА ===",
+    ])
+    return "\n".join(lines)
 
 
 def context_label(ctx):  # type: (int | None) -> str
@@ -570,6 +693,23 @@ def _module_short_name(module_name):
     return parts[-1] if parts else module_name
 
 
+def _event_sort_key(event):
+    return (
+        int(event.get("block_id", 0) or 0),
+        int(event.get("Level", 0) or 0),
+        str(event.get("Module", "")),
+        int(event.get("Line", 0) or 0),
+        str(event.get("Code", "")),
+        float(event.get("Total", 0) or 0),
+        float(event.get("Pure", 0) or 0),
+    )
+
+
+def _event_ref(event):
+    event_id = event.get("_event_id", "E00000")
+    return f"{event_id} -> {event.get('Module', '?')}:{event.get('Line', '?')}"
+
+
 def _is_callback(event):
     """Определяет, является ли событие колбэком (для свёртки цепочек)."""
     code = (event.get("Code") or "").strip()
@@ -705,7 +845,8 @@ class ProcedureGrouper:
     def group(self):
         groups = []
         index = {}
-        for e in self.events:
+        sorted_events = sorted(self.events, key=_event_sort_key)
+        for e in sorted_events:
             key = (e["Module"], e.get("Context"), e.get("Extension"), e.get("block_id", 0))
             if key not in index:
                 index[key] = len(groups)
@@ -717,8 +858,17 @@ class ProcedureGrouper:
                     "events": [],
                 })
             groups[index[key]]["events"].append(e)
+        groups.sort(
+            key=lambda g: (
+                int(g.get("block_id", 0) or 0),
+                str(g.get("module", "")),
+                str(g.get("extension", "")),
+                int(g.get("context", -1) if g.get("context") is not None else -1),
+            )
+        )
         for g in groups:
             g["blocks"] = self._split_group_to_blocks(g["events"])
+            g["blocks"].sort(key=lambda b: (int(b["line_start"]), int(b["line_end"]), str(b["type"])))
         return groups
 
 
@@ -774,8 +924,16 @@ class CallMapBuilder:
             if best:
                 group, block = best
                 item["reference"] = {"group": group, "block": block}
+                item["reference_inferred"] = True
             result.append(item)
-        result.sort(key=lambda x: x["budget"], reverse=True)
+        result.sort(
+            key=lambda x: (
+                -x["budget"],
+                int(x["event"].get("block_id", 0) or 0),
+                str(x["event"].get("Module", "")),
+                int(x["event"].get("Line", 0) or 0),
+            )
+        )
         return result
 
 
@@ -784,17 +942,20 @@ class CallMapBuilder:
 # ==================================================================================================
 
 class ExecutionFlowBuilder:
-    """Строит эвристическое дерево вызовов (EXECUTION FLOW) для TRACE v4."""
+    """Build a heuristic execution tree for TRACE."""
 
-    def __init__(self, events, grouped_modules, threshold_ms):
+    def __init__(self, events, grouped_modules, threshold_ms, detail_profile=None):
         self.events = events
         self.grouped_modules = grouped_modules
         self.threshold_ms = threshold_ms
+        self.detail_profile = detail_profile or TRACE_DETAIL_PROFILES[TRACE_NORMAL]
         self.block_index = self._build_block_index()
-        self.used_blocks = set()  # id(block) для блоков, уже использованных как дочерние
+        self.used_blocks = set()
+        self.shown_event_ids = set()
+        self.hidden_reasons = _coverage_counters()
 
     def _build_block_index(self):
-        """Индекс: (module_short_name, context) -> [{"group": g, "block": b}, ...]"""
+        """Index blocks by (module_short_name, context)."""
         index = defaultdict(list)
         for g in self.grouped_modules:
             mod_wo_ext = _strip_extension_prefix(g["module"], g.get("extension"))
@@ -802,19 +963,27 @@ class ExecutionFlowBuilder:
             ctx = g.get("context")
             for b in g.get("blocks", []):
                 index[(short, ctx)].append({"group": g, "block": b})
-            # Также индексируем без контекста для более гибкого поиска
             for b in g.get("blocks", []):
                 index[(short, None)].append({"group": g, "block": b})
+
+        for key in list(index.keys()):
+            index[key].sort(
+                key=lambda x: (
+                    -float(x["block"].get("total", 0) or 0),
+                    int(x["group"].get("block_id", 0) or 0),
+                    str(x["group"].get("module", "")),
+                    int(x["block"].get("line_start", 0) or 0),
+                )
+            )
         return index
 
     def _find_child_block(self, caller_event, budget_ms):
-        """Найти дочерний блок по имени модуля из кода и Budget-matching."""
+        """Find child block by target module + budget matching."""
         target_short = _extract_called_module(caller_event.get("Code"))
         if not target_short:
             return None
 
         candidates = []
-        # Ищем сначала с учётом контекста, потом без
         for ctx_key in [caller_event.get("Context"), None]:
             for entry in self.block_index.get((target_short, ctx_key), []):
                 b = entry["block"]
@@ -827,14 +996,19 @@ class ExecutionFlowBuilder:
 
         if not candidates:
             return None
-        candidates.sort(key=lambda x: x[0])
+        candidates.sort(
+            key=lambda x: (
+                x[0],
+                int(x[1]["group"].get("block_id", 0) or 0),
+                str(x[1]["group"].get("module", "")),
+                int(x[1]["block"].get("line_start", 0) or 0),
+            )
+        )
         best = candidates[0][1]
         self.used_blocks.add(id(best["block"]))
         return best
 
     def _build_subtree(self, block, group, depth=0, max_depth=15):
-        """Рекурсивно строит дерево вызовов для одного блока.
-        Фильтрует тривиальные события — оставляет только значимые (budget или self > threshold)."""
         if depth > max_depth:
             return []
 
@@ -843,27 +1017,31 @@ class ExecutionFlowBuilder:
         mod_short = _module_short_name(mod_wo_ext)
 
         nodes = []
-        for e in block["events"]:
+        block_events = sorted(block.get("events", []), key=_event_sort_key)
+        for e in block_events:
             budget = e["Total"] - e["Pure"]
             is_cb = _is_callback(e)
             code = e.get("Code") or ""
             is_control = _is_control_flow_line(code)
             has_called_module = _extract_called_module(code) is not None
 
-            # Фильтрация: показываем только значимые события
-            # - budget > threshold (есть значимые дочерние вызовы)
-            # - Pure > threshold (значимое собственное время)
-            # - колбэки (для свёртки цепочек)
-            # - Total > threshold (значимое включительное время)
             if (budget <= self.threshold_ms and e["Pure"] <= self.threshold_ms
                     and e["Total"] <= self.threshold_ms and not is_cb):
+                self.hidden_reasons["threshold_hidden"] += 1
                 continue
 
-            # Убираем управляющие строки (Если/Иначе/Циклы), если они не несут полезного сигнала:
-            # нет явного вызова модуля, нет колбэка, почти лист и время ниже "рабочего" порога.
-            control_threshold = max(1.0, self.threshold_ms)
+            control_threshold = max(
+                self.detail_profile.get("flow_floor_ms", 0.5),
+                self.threshold_ms * self.detail_profile.get("control_multiplier", 1.0),
+            )
             if (is_control and not has_called_module and not is_cb
                     and _is_leaf_like_event(e) and e["Total"] <= control_threshold):
+                self.hidden_reasons["control_leaf_noise"] += 1
+                continue
+
+            tiny_leaf_limit = self.detail_profile.get("leaf_tiny_total_ms", 0.01)
+            if e["Total"] <= tiny_leaf_limit and _is_leaf_like_event(e):
+                self.hidden_reasons["tiny_leaf"] += 1
                 continue
 
             node = {
@@ -880,35 +1058,28 @@ class ExecutionFlowBuilder:
                 child_entry = self._find_child_block(e, budget)
                 if child_entry:
                     child_nodes = self._build_subtree(
-                        child_entry["block"], child_entry["group"],
-                        depth=depth + 1, max_depth=max_depth
+                        child_entry["block"], child_entry["group"], depth=depth + 1, max_depth=max_depth
                     )
                     node["children"] = child_nodes
 
             nodes.append(node)
+
         return nodes
 
-    def _find_root_blocks(self):
-        """Определить корневые блоки — те, что не были использованы как дочерние.
-        Отсортированы по Total (от наибольшего)."""
-        roots = []
-        for g in self.grouped_modules:
-            for b in g.get("blocks", []):
-                if id(b) not in self.used_blocks and b["total"] >= self.threshold_ms:
-                    roots.append({"group": g, "block": b})
-        # Сортируем по Total desc — основные ветви выполнения сверху
-        roots.sort(key=lambda x: x["block"]["total"], reverse=True)
-        return roots
-
     def build(self):
-        """Основной метод: строит лес деревьев и форматирует в строки."""
-        # Шаг 1: Начинаем с блоков, имеющих наибольший Total, строим деревья вниз
         all_blocks = []
         for g in self.grouped_modules:
             for b in g.get("blocks", []):
                 if b["total"] >= self.threshold_ms:
                     all_blocks.append({"group": g, "block": b, "total": b["total"]})
-        all_blocks.sort(key=lambda x: x["total"], reverse=True)
+        all_blocks.sort(
+            key=lambda x: (
+                -float(x["total"]),
+                int(x["group"].get("block_id", 0) or 0),
+                str(x["group"].get("module", "")),
+                int(x["block"].get("line_start", 0) or 0),
+            )
+        )
 
         forest = []
         for entry in all_blocks:
@@ -918,54 +1089,61 @@ class ExecutionFlowBuilder:
             self.used_blocks.add(id(b))
             subtree = self._build_subtree(b, entry["group"])
             if subtree:
-                forest.append({
-                    "group": entry["group"],
-                    "block": b,
-                    "nodes": subtree,
-                })
+                forest.append({"group": entry["group"], "block": b, "nodes": subtree})
 
-        # Шаг 2: Форматирование
         lines = []
         lines.append("=== EXECUTION FLOW (эвристическая реконструкция) ===")
-        lines.append("Вложенность восстановлена по Budget-matching и именам модулей.")
-        lines.append("Колбэки (ВыполнитьОбработкуОповещения и т.п.) свёрнуты.")
+        lines.append("Связи восстановлены эвристически и помечены как INFERRED.")
         lines.append("")
 
         for tree in forest:
             self._format_tree_nodes(tree["nodes"], lines, indent=0, prev_module=None)
             lines.append("")
 
-        return "\n".join(lines)
+        return {
+            "text": "\n".join(lines),
+            "shown_event_ids": set(self.shown_event_ids),
+            "hidden_reasons": dict(self.hidden_reasons),
+        }
 
     def _format_tree_nodes(self, nodes, lines, indent, prev_module):
-        """Форматирует узлы дерева с обработкой колбэк-цепочек."""
         i = 0
         while i < len(nodes):
             node = nodes[i]
 
-            # Проверяем цепочку колбэков
             if node["is_callback"]:
                 cb_chain = [node]
                 j = i + 1
                 while j < len(nodes) and nodes[j]["is_callback"]:
                     cb_chain.append(nodes[j])
                     j += 1
-                if len(cb_chain) >= 3:
-                    # Свёртка колбэков
+                collapse_min_chain = self.detail_profile.get("collapse_callback_min_chain", 3)
+                if len(cb_chain) >= collapse_min_chain:
+                    first_event = cb_chain[0]["event"]
+                    first_event_id = first_event.get("_event_id", "E00000")
+                    last_event_id = cb_chain[-1]["event"].get("_event_id", first_event_id)
+                    self.shown_event_ids.add(first_event_id)
+                    self.hidden_reasons["collapsed_callbacks"] += max(0, len(cb_chain) - 1)
+
                     parts = []
                     for cb in cb_chain:
                         e = cb["event"]
                         parts.append(f"{cb['module_short']}:{e['Line']}")
+
                     prefix = "  " * indent
-                    lines.append(f"{prefix}⤷ [колбэки ×{len(cb_chain)}: {' → '.join(parts)}]")
+                    lines.append(
+                        f"{prefix}[INFERRED {first_event_id}..{last_event_id}] "
+                        f"[callbacks x{len(cb_chain)}: {' -> '.join(parts)}]"
+                    )
                     i = j
                     continue
 
             e = node["event"]
+            eid = e.get("_event_id", "E00000")
+            self.shown_event_ids.add(eid)
             ctx_label_str = context_label(node["context"]) or "?"
             prefix = "  " * indent
 
-            # Модуль — показывать при смене
             show_module = (prev_module != node["module_short"])
             if show_module:
                 location = f"{node['module_short']}:{e['Line']}"
@@ -973,19 +1151,13 @@ class ExecutionFlowBuilder:
                 location = f":{e['Line']}"
 
             code_snip = (e["Code"] or "").strip().replace("\n", " ")
+            self_highlight_threshold = max(
+                self.threshold_ms,
+                self.detail_profile.get("leaf_self_highlight_min_ms", 10.0),
+            )
 
-            # Время:
-            # - Листья с Pure > 10ms (или > threshold): [Self: Xms]
-            # - Остальные: [Total]
-            # - Если Total < 1ms (округляется до 0), время не выводим вообще
-            
-            # Порог для выделения Self-времени (чтобы не подсвечивать 0ms/2ms)
-            self_highlight_threshold = max(self.threshold_ms, 10.0)
-            
             time_str = ""
-            total_rounded = round(e['Total'])
-            
-            if total_rounded > 0:
+            if round(e["Total"]) > 0:
                 if node["children"]:
                     if e["Pure"] > self_highlight_threshold:
                         time_str = f"[{e['Total']:.0f}ms / {e['Pure']:.0f}ms]"
@@ -997,14 +1169,19 @@ class ExecutionFlowBuilder:
                     else:
                         time_str = f"[{e['Total']:.0f}ms]"
 
+            inferred_ref = _event_ref(e)
             if show_module:
-                lines.append(f"{prefix}[{ctx_label_str}] {location} | {code_snip}  {time_str}".rstrip())
+                lines.append(
+                    f"{prefix}[INFERRED {inferred_ref}] [{ctx_label_str}] "
+                    f"{location} | {code_snip}  {time_str}".rstrip()
+                )
             else:
-                lines.append(f"{prefix}{location} | {code_snip}  {time_str}".rstrip())
+                lines.append(
+                    f"{prefix}[INFERRED {inferred_ref}] "
+                    f"{location} | {code_snip}  {time_str}".rstrip()
+                )
 
             prev_module = node["module_short"]
-
-            # Рекурсивно форматируем дочерние узлы
             if node["children"]:
                 self._format_tree_nodes(node["children"], lines, indent + 1, prev_module)
 
@@ -1234,16 +1411,25 @@ CONTEXT_COL_WIDTH = 5  # "[C→S]" = 5 символов
 
 
 class ReportGenerator:
-    def __init__(self, events, session_info=None, threshold_ms=None, all_events=None, compact=True, show_context=True, expand_module_names=True):
+    def __init__(self, events, session_info=None, threshold_ms=None, all_events=None,
+                 trace_detail=TRACE_NORMAL, show_context=True, expand_module_names=True,
+                 source_file_path=None, trace_request_meta=None, include_model_prompt=True):
         self.events = events
         self.session_info = session_info or {}
         self.all_events = all_events if all_events is not None else events
         self.modules_map = {}
         self.modules_list = []
         self.threshold_ms = threshold_ms
-        self.compact = compact
+        self.trace_detail = normalize_trace_detail(trace_detail)
+        self.trace_profile = TRACE_DETAIL_PROFILES[self.trace_detail]
         self.show_context = show_context
         self.expand_module_names = expand_module_names
+        self.source_file_path = source_file_path
+        self.trace_request_meta = trace_request_meta or {}
+        self.include_model_prompt = include_model_prompt
+        self.trace_coverage = {}
+        self.trace_internal_metrics = {}
+        self._assign_event_ids()
 
         # v4: определяем, есть ли реальные уровни вложенности (Level > 0)
         self.has_level = any(e["Level"] > 0 for e in events) if events else False
@@ -1252,6 +1438,11 @@ class ReportGenerator:
             min_level = min(e['Level'] for e in events)
             for e in events:
                 e['Level'] -= min_level
+
+    def _assign_event_ids(self):
+        ordered = list(self.all_events) if self.all_events is not None else list(self.events)
+        for idx, event in enumerate(ordered, 1):
+            event["_event_id"] = f"E{idx:05d}"
 
     def get_module_id(self, full_name):
         """При expand_module_names — полное имя; иначе M1, M2 и секция МОДУЛИ."""
@@ -1303,24 +1494,73 @@ class ReportGenerator:
         return loc
 
     def generate_trace(self):
-        """TRACE v4: EXECUTION FLOW + CALL MAP + MODULES (оптимизированные)."""
+        """TRACE v6: META + COVERAGE + EXECUTION FLOW + CALL MAP + MODULES + REPRODUCE."""
         lines = []
         grouped = ProcedureGrouper(self.events).group()
         trace_flow_threshold = self._calc_trace_flow_threshold()
         trace_modules_threshold = self._calc_trace_modules_threshold(trace_flow_threshold)
-        call_map = CallMapBuilder(self.events, grouped, threshold_ms=trace_flow_threshold).build()
-        call_map, call_map_omitted = self._limit_call_map(call_map)
+        call_map_all = CallMapBuilder(self.events, grouped, threshold_ms=trace_flow_threshold).build()
+        call_map, call_map_omitted = self._limit_call_map(call_map_all)
 
-        lines.append("=== TRACE ===")
+        mode_label = trace_detail_label(self.trace_detail)
+        lines.append(f"=== TRACE [{mode_label}] ===")
+        lines.append("")
+        lines.extend(self._build_trace_meta_lines(trace_flow_threshold, trace_modules_threshold))
         lines.append("")
 
         # EXECUTION FLOW (v4) — перед CALL MAP
-        ef_builder = ExecutionFlowBuilder(self.events, grouped, trace_flow_threshold)
-        lines.append(ef_builder.build())
+        ef_builder = ExecutionFlowBuilder(
+            self.events,
+            grouped,
+            trace_flow_threshold,
+            detail_profile=self.trace_profile,
+        )
+        ef_result = ef_builder.build()
+        modules_result = self._build_modules_section(grouped, trace_modules_threshold)
+
+        coverage_reasons = self._merge_coverage(
+            ef_result.get("hidden_reasons", {}),
+            modules_result.get("hidden_reasons", {}),
+        )
+        coverage_reasons["threshold_hidden"] += call_map_omitted
+        events_total = len(self.events)
+        flow_shown_ids = set(ef_result.get("shown_event_ids", set()))
+        modules_shown_ids = set(modules_result.get("shown_event_ids", set()))
+        self.trace_coverage = {
+            "events_total": events_total,
+            "events_shown": len(flow_shown_ids),
+            "events_hidden": max(0, events_total - len(flow_shown_ids)),
+            "call_map_total_entries": len(call_map_all),
+            "call_map_shown_entries": len(call_map),
+            "call_map_hidden_entries": max(0, len(call_map_all) - len(call_map)),
+            "modules_total_events": events_total,
+            "modules_shown_events": len(modules_shown_ids),
+            "modules_hidden_events": max(0, events_total - len(modules_shown_ids)),
+            "reasons": coverage_reasons,
+        }
+        shown_time_ms = sum(e["Total"] for e in self.events if e.get("_event_id") in flow_shown_ids)
+        total_time_ms = sum(e["Total"] for e in self.events)
+        call_map_budget_total = sum(item["budget"] for item in call_map_all)
+        call_map_budget_shown = sum(item["budget"] for item in call_map)
+        self.trace_internal_metrics = {
+            "time_total_ms": total_time_ms,
+            "time_shown_ms": shown_time_ms,
+            "time_hidden_ms": max(0.0, total_time_ms - shown_time_ms),
+            "time_coverage_pct": (shown_time_ms * 100.0 / total_time_ms) if total_time_ms > 0 else 0.0,
+            "call_map_budget_total_ms": call_map_budget_total,
+            "call_map_budget_shown_ms": call_map_budget_shown,
+            "call_map_budget_coverage_pct": (
+                call_map_budget_shown * 100.0 / call_map_budget_total
+                if call_map_budget_total > 0 else 0.0
+            ),
+        }
+        lines.extend(self._build_trace_coverage_lines())
+        lines.append("")
+        lines.append(ef_result.get("text", ""))
         lines.append("")
 
         lines.append("=== CALL MAP ===")
-        lines.append("Budget = Total - Pure (время, ушедшее во вложенные вызовы).")
+        lines.append("Budget = Total - Pure.")
         if not call_map:
             lines.append("Нет строк с заметным бюджетом вложенных вызовов.")
         else:
@@ -1329,7 +1569,10 @@ class ReportGenerator:
                 ctx = context_label(e.get("Context")) or "?"
                 mod_name = _strip_extension_prefix(e["Module"], e.get("Extension"))
                 mod_short = _module_short_name(mod_name)
-                lines.append(f"#{idx} [{ctx}] {mod_short}:{e['Line']} | Budget: {item['budget']:.2f}ms")
+                lines.append(
+                    f"#{idx} [FACT {_event_ref(e)}] [{ctx}] {mod_short}:{e['Line']} "
+                    f"| Budget: {item['budget']:.2f}ms"
+                )
                 lines.append(f"   {(e.get('Code') or '').strip().replace(chr(10), ' ')}")
                 ref = item["reference"]
                 if ref:
@@ -1339,51 +1582,138 @@ class ReportGenerator:
                     g_mod = _strip_extension_prefix(g["module"], g.get("extension"))
                     g_short = _module_short_name(g_mod)
                     lines.append(
-                        f"   -> see: {g_short} [{g_ctx}] {b['type']}(:{b['line_start']}-{b['line_end']}) [Total: {b['total']:.2f}ms]"
+                        f"   -> [INFERRED] see: {g_short} [{g_ctx}] "
+                        f"{b['type']}(:{b['line_start']}-{b['line_end']}) [Total: {b['total']:.2f}ms]"
                     )
                 lines.append("")
             if call_map_omitted > 0:
-                lines.append(f"... ещё {call_map_omitted} строк с меньшим Budget скрыто")
+                lines.append(f"... ещё {call_map_omitted} строк CALL MAP скрыто по порогу/бюджету")
                 lines.append("")
 
-        lines.append("=== MODULES (справочник модулей) ===")
+        lines.append(modules_result.get("text", ""))
+        lines.append("")
+        lines.extend(self._build_trace_reproduce_lines())
+        return "\n".join(lines)
 
-        # Вычисляем порог для модулей (threshold для MODULES)
-        modules_threshold = trace_modules_threshold
+    @staticmethod
+    def _merge_coverage(*counters):
+        merged = _coverage_counters()
+        for counter in counters:
+            for key in TRACE_COVERAGE_REASON_KEYS:
+                merged[key] += int(counter.get(key, 0))
+        return merged
+
+    def _build_trace_meta_lines(self, flow_threshold, modules_threshold):
+        lines = ["=== TRACE META ==="]
+        lines.append(f"trace_format: {TRACE_FORMAT_VERSION}")
+        lines.append("mode: TRACE")
+        lines.append(f"trace_detail: {self.trace_detail}")
+        lines.append(f"entry: {self.trace_request_meta.get('entry') or 'all'}")
+        mb = self.trace_request_meta.get("main_block")
+        lines.append(f"main_block: {mb if mb is not None else 'all'}")
+        lines.append(f"flow_threshold_ms: {flow_threshold:.4f}")
+        lines.append(f"modules_threshold_ms: {modules_threshold:.4f}")
+        lines.append(
+            "flags: "
+            f"show_context={self.show_context}, "
+            f"expand_module_names={self.expand_module_names}, "
+            f"collapse_repeats_min={self.trace_profile.get('collapse_repeat_min_count')}, "
+            f"collapse_callbacks_min={self.trace_profile.get('collapse_callback_min_chain')}"
+        )
+        return lines
+
+    def _build_trace_coverage_lines(self):
+        c = self.trace_coverage
+        r = c.get("reasons", {})
+        lines = ["=== TRACE COVERAGE ==="]
+        lines.append(
+            f"events_total={c.get('events_total', 0)} "
+            f"events_shown={c.get('events_shown', 0)} "
+            f"events_hidden={c.get('events_hidden', 0)}"
+        )
+        lines.append(
+            f"call_map_total_entries={c.get('call_map_total_entries', 0)} "
+            f"call_map_shown_entries={c.get('call_map_shown_entries', 0)} "
+            f"call_map_hidden_entries={c.get('call_map_hidden_entries', 0)}"
+        )
+        lines.append(
+            f"modules_total_events={c.get('modules_total_events', 0)} "
+            f"modules_shown_events={c.get('modules_shown_events', 0)} "
+            f"modules_hidden_events={c.get('modules_hidden_events', 0)}"
+        )
+        for key in TRACE_COVERAGE_REASON_KEYS:
+            lines.append(f"{key}={int(r.get(key, 0))}")
+        return lines
+
+    def _build_trace_reproduce_lines(self):
+        lines = ["=== TRACE REPRODUCE ==="]
+        if not self.source_file_path:
+            lines.append("same_report: (source file path unavailable)")
+            lines.append("trace_full: (source file path unavailable)")
+            return lines
+
+        meta = self.trace_request_meta
+        same_cmd = _repro_cli_command(
+            self.source_file_path,
+            mode="TRACE",
+            trace_detail=self.trace_detail,
+            entry=meta.get("entry"),
+            main_block=meta.get("main_block"),
+            expand_module_names=self.expand_module_names,
+            include_model_prompt=self.include_model_prompt,
+        )
+        full_cmd = _repro_cli_command(
+            self.source_file_path,
+            mode="TRACE",
+            trace_detail=TRACE_FULL,
+            entry=meta.get("entry"),
+            main_block=meta.get("main_block"),
+            expand_module_names=self.expand_module_names,
+            include_model_prompt=self.include_model_prompt,
+        )
+        lines.append(f"same_report: {same_cmd}")
+        lines.append(f"trace_full: {full_cmd}")
+        return lines
+
+    def _build_modules_section(self, grouped, modules_threshold):
+        lines = ["=== MODULES (справочник модулей) ==="]
+        shown_event_ids = set()
+        hidden_reasons = _coverage_counters()
 
         for g in grouped:
-            # Правило 4: модули с суммой Total всех блоков < threshold — пропускаем
-            module_total = sum(b["total"] for b in g.get("blocks", []))
+            module_events = sorted(g.get("events", []), key=_event_sort_key)
+            module_total = sum(e.get("Total", 0) for e in module_events)
             if module_total < modules_threshold:
+                hidden_reasons["threshold_hidden"] += len(module_events)
                 continue
 
             ctx = context_label(g.get("context")) or "?"
             mod_name = _strip_extension_prefix(g["module"], g.get("extension"))
             module_display = self.get_module_id(mod_name)
-            
+
             bid = g.get("block_id", 0)
             si = self.session_info.get(bid, {})
             app_type = si.get("app_type")
             app_label = SESSION_TYPES.get(app_type, f"Тип {app_type}") if app_type else ""
-            
+
             header_parts = []
             if app_label:
                 header_parts.append(f"B{bid} [{app_label}]")
-            
             if g.get("extension"):
                 header_parts.append(f"[Ext:{g['extension']}]")
-            
             header_parts.append(module_display)
-            
+
             lines.append("")
             lines.append(f"--- {' '.join(header_parts)} ---")
             lines.append("")
+
             for b in g.get("blocks", []):
-                # Правило 1: свёртка тривиальных процедур
+                block_events = sorted(b.get("events", []), key=_event_sort_key)
                 if b["total"] < modules_threshold:
+                    hidden_reasons["threshold_hidden"] += len(block_events)
                     lines.append(
                         f"  [{ctx}] {b['type']} (:{b['line_start']}-{b['line_end']}) "
-                        f"Total: {b['total']:.2f}ms  [свёрнуто]"
+                        f"Total: {b['total']:.2f}ms  [свёрнуто по threshold]"
                     )
                     continue
 
@@ -1392,28 +1722,37 @@ class ReportGenerator:
                     f"Total: {b['total']:.2f}ms Pure: {b['pure']:.2f}ms"
                 )
 
-                # Фильтрация и коллапс строк внутри блока
-                filtered_events = self._filter_block_events(b["events"], modules_threshold)
-                collapsed = self._collapse_repeated_events(filtered_events)
+                filtered_events = self._filter_block_events(block_events, modules_threshold, hidden_reasons)
+                collapsed = self._collapse_repeated_events(filtered_events, hidden_reasons)
 
                 for item in collapsed:
                     if item["type"] == "single":
                         e = item["event"]
+                        shown_event_ids.add(e.get("_event_id", "E00000"))
                         code_lines = (e["Code"] or "").replace("\r", "").split("\n")
                         if not code_lines:
                             code_lines = [""]
-                        lines.append(f"    :{e['Line']} | {code_lines[0]}  {e['Total']:.3f}  {e['Pure']:.3f}")
+                        lines.append(
+                            f"    [FACT {_event_ref(e)}] :{e['Line']} | "
+                            f"{code_lines[0]}  {e['Total']:.3f}  {e['Pure']:.3f}"
+                        )
                         for extra in code_lines[1:]:
                             lines.append(f"           | {extra}")
                     elif item["type"] == "collapsed":
+                        shown_event_ids.add(item["first_event_id"])
                         lines.append(
-                            f"    :{item['line_start']}-{item['line_end']} | "
-                            f"{item['count']}× {item['pattern']}  Total: {item['total']:.2f}ms"
+                            f"    [FACT {item['first_event_id']}..{item['last_event_id']}] "
+                            f":{item['line_start']}-{item['line_end']} | "
+                            f"{item['count']}x {item['pattern']}  Total: {item['total']:.2f}ms"
                         )
 
                 lines.append("")
 
-        return "\n".join(lines)
+        return {
+            "text": "\n".join(lines),
+            "shown_event_ids": shown_event_ids,
+            "hidden_reasons": hidden_reasons,
+        }
 
     def generate_perf(self):
         """PERF v4: TOP ISSUES (для формата 2b/2c без Level) или дерево (для формата 1 с Level) + Hotspots."""
@@ -1575,31 +1914,37 @@ class ReportGenerator:
             reverse=True
         )
         if not budgets:
-            return 0.5
+            return float(self.trace_profile.get("flow_floor_ms", 0.5))
 
         total_ms = sum(e["Total"] for e in self.events)
-        base_threshold = max(0.5, total_ms * 0.0004)
+        base_threshold = max(
+            float(self.trace_profile.get("flow_floor_ms", 0.5)),
+            total_ms * float(self.trace_profile.get("flow_base_factor", 0.0004)),
+        )
 
         # Держим плотность EXECUTION FLOW управляемой: срез по 150-му значимому budget.
-        target_rank = min(150, len(budgets))
-        rank_idx = target_rank - 1
+        target_rank = min(int(self.trace_profile.get("flow_target_rank", 150)), len(budgets))
+        rank_idx = max(0, target_rank - 1)
         rank_threshold = budgets[rank_idx]
 
         return max(base_threshold, rank_threshold)
 
-    @staticmethod
-    def _calc_trace_modules_threshold(flow_threshold):
-        """Порог для MODULES в TRACE: мягче, чем для EXECUTION FLOW."""
-        return max(0.5, flow_threshold * 0.25)
+    def _calc_trace_modules_threshold(self, flow_threshold):
+        """MODULES threshold for TRACE based on active trace_detail profile."""
+        ratio = float(self.trace_profile.get("modules_ratio", 0.25))
+        floor = float(self.trace_profile.get("modules_floor_ms", 0.5))
+        return max(floor, flow_threshold * ratio)
 
     def _limit_call_map(self, call_map):
         """Ограничить длину CALL MAP по покрытию бюджета и максимальному размеру."""
         if not call_map:
             return call_map, 0
 
-        max_items = max(60, min(240, len(self.events) // 45))
-        min_items = min(60, max_items)
-        target_coverage = 0.90
+        max_items_profile = int(self.trace_profile.get("call_map_max_items", 240))
+        min_items_profile = int(self.trace_profile.get("call_map_min_items", 60))
+        max_items = max(1, min(max_items_profile, max(1, len(call_map))))
+        min_items = min(max_items, max(1, min_items_profile))
+        target_coverage = float(self.trace_profile.get("call_map_target_coverage", 0.90))
         total_budget = sum(item["budget"] for item in call_map)
 
         selected = []
@@ -1623,39 +1968,48 @@ class ReportGenerator:
         total_ms = sum(e["Total"] for e in self.events)
         return max(0.5, total_ms * 0.01)
 
-    def _filter_block_events(self, events, modules_threshold=0.0):
+    def _filter_block_events(self, events, modules_threshold=0.0, hidden_reasons=None):
         """Правило 2: фильтр строк — убрать структурный шум и тривиальные строки."""
         result = []
-        control_threshold = max(0.05, modules_threshold * 0.25)
+        hidden_reasons = hidden_reasons if hidden_reasons is not None else _coverage_counters()
+        control_threshold = max(
+            0.05,
+            modules_threshold * float(self.trace_profile.get("control_multiplier", 1.0)),
+        )
+        tiny_leaf_limit = float(self.trace_profile.get("leaf_tiny_total_ms", 0.01))
         for e in events:
             code = (e.get("Code") or "").strip()
 
             # Убрать структурный шум
             if any(code.startswith(noise) for noise in STRUCTURAL_NOISE):
+                hidden_reasons["structural_noise"] += 1
                 continue
 
             # Убрать пустые управляющие переходы (без информативной нагрузки).
             if code in TERMINAL_FLOW_STATEMENTS and e["Total"] <= max(0.1, modules_threshold):
+                hidden_reasons["terminal_trivial"] += 1
                 continue
 
             # Убрать дешёвые управляющие конструкции (Если/Иначе/Цикл), если они не вызывают модуль.
             has_called_module = _extract_called_module(code) is not None
             if (_is_control_flow_line(code) and not has_called_module
                     and _is_leaf_like_event(e) and e["Total"] <= control_threshold):
+                hidden_reasons["control_leaf_noise"] += 1
                 continue
 
             # Убрать тривиальные строки: Total < 0.01 мс И Pure ≈ Total (разница < 10%)
-            if e["Total"] < 0.01:
+            if e["Total"] < tiny_leaf_limit:
                 if e["Total"] == 0 or _is_leaf_like_event(e):
+                    hidden_reasons["tiny_leaf"] += 1
                     continue
             result.append(e)
         return result
 
-    @staticmethod
-    def _collapse_repeated_events(events):
+    def _collapse_repeated_events(self, events, hidden_reasons=None):
         """Правило 3: коллапс повторов — если N >= 5 подряд с одинаковым паттерном кода."""
         if not events:
             return []
+        hidden_reasons = hidden_reasons if hidden_reasons is not None else _coverage_counters()
 
         def _code_pattern(code):
             """Извлечь паттерн кода (до первой скобки или первое слово)."""
@@ -1673,9 +2027,12 @@ class ReportGenerator:
             while j < len(events) and _code_pattern(events[j].get("Code")) == pat:
                 j += 1
             count = j - i
-            collapse_min_count = 4 if len(events) >= 40 else 5
+            collapse_min_count = int(self.trace_profile.get("collapse_repeat_min_count", 5))
             if count >= collapse_min_count:
                 total = sum(e["Total"] for e in events[i:j])
+                first_event_id = events[i].get("_event_id", "E00000")
+                last_event_id = events[j - 1].get("_event_id", first_event_id)
+                hidden_reasons["collapsed_repeats"] += max(0, count - 1)
                 result.append({
                     "type": "collapsed",
                     "line_start": events[i]["Line"],
@@ -1683,6 +2040,8 @@ class ReportGenerator:
                     "count": count,
                     "pattern": pat + "(...)",
                     "total": total,
+                    "first_event_id": first_event_id,
+                    "last_event_id": last_event_id,
                 })
             else:
                 for k in range(i, j):
@@ -1692,7 +2051,7 @@ class ReportGenerator:
 
     def _ensure_modules(self):
         """Предзаполнить легенду модулей из событий."""
-        for e in self.events:
+        for e in sorted(self.events, key=_event_sort_key):
             self.get_module_id(e['Module'])
 
     def _get_extensions(self):
@@ -1707,6 +2066,7 @@ class ReportGenerator:
     def get_full_report(self, entry_info="all", blocks_info="", mode="TRACE", include_model_prompt=True):
         parts = []
         self._ensure_modules()
+        include_model_prompt = bool(include_model_prompt)
 
         # Header + Summary
         parts.append("=== ОТЧЁТ PFF ===")
@@ -1721,22 +2081,10 @@ class ReportGenerator:
             parts.extend(extensions)
             parts.append("")
 
-        # Modules (только при коротких именах M1, M2)
-        if mode == "TRACE":
-             parts.append("=== МОДУЛИ ===")
-             if not self.expand_module_names and self.modules_list:
-                 parts.extend(self.modules_list)
-             elif self.expand_module_names:
-                 parts.pop() # Remove header if empty
-             else:
-                 parts.append("(пусто)")
-             if parts and parts[-1] != "":
-                parts.append("")
-
         # Trace
         if mode == "TRACE":
             if include_model_prompt:
-                parts.append(TRACE_MODEL_PROMPT.strip())
+                parts.append(build_trace_model_prompt(self.trace_detail).strip())
                 parts.append("")
             parts.append(self.generate_trace())
             parts.append("")
@@ -1756,7 +2104,7 @@ class ReportGenerator:
 # ==================================================================================================
 
 def process_pff(file_path, entry=None, main_block=None,
-                threshold_ms=None, mode="TRACE", no_compact=False,
+                threshold_ms=None, mode="TRACE", trace_detail=TRACE_NORMAL, no_compact=False,
                 no_context=False, expand_module_names=True, include_model_prompt=True):
     if not os.path.exists(file_path):
         return "File not found."
@@ -1776,12 +2124,16 @@ def process_pff(file_path, entry=None, main_block=None,
     # all_evts = builder.build()
 
     num_blocks = len(set(e.get('block_id', 0) for e in all_evts))
+    mode = (mode or "TRACE").upper()
+    normalized_trace_detail = normalize_trace_detail(trace_detail)
+    trace_main_block = main_block
 
     # Фильтрация: при entry — отбор блока, в который входит указанная строка; при main_block — только этот блок
     if entry:
         entry_event = resolve_entry(all_evts, entry)
         if entry_event is not None:
             bid = entry_event.get('block_id', 0)
+            trace_main_block = bid
             events = filter_by_main_block(all_evts, bid)
             entry_info = entry
             blocks_info = f"Блок B{bid}, содержащий «{entry}» ({len(events)} соб.)"
@@ -1817,8 +2169,25 @@ def process_pff(file_path, entry=None, main_block=None,
     effective_threshold_ms = threshold_ms
     if mode == "TRACE":
         effective_threshold_ms = None
+        if no_compact:
+            normalized_trace_detail = TRACE_FULL
 
-    generator = ReportGenerator(events, session_info=session_info, threshold_ms=effective_threshold_ms, all_events=all_evts, compact=not no_compact, show_context=not no_context, expand_module_names=expand_module_names)
+    trace_request_meta = {
+        "entry": entry,
+        "main_block": trace_main_block,
+    }
+    generator = ReportGenerator(
+        events,
+        session_info=session_info,
+        threshold_ms=effective_threshold_ms,
+        all_events=all_evts,
+        trace_detail=normalized_trace_detail,
+        show_context=not no_context,
+        expand_module_names=expand_module_names,
+        source_file_path=file_path,
+        trace_request_meta=trace_request_meta,
+        include_model_prompt=include_model_prompt,
+    )
     return generator.get_full_report(
         entry_info=entry_info,
         blocks_info=blocks_info,
@@ -1840,8 +2209,10 @@ def main():
                         help="Порог значимости (мс) для PERF. В TRACE игнорируется (порог=0).")
     parser.add_argument("--mode", choices=["TRACE", "PERF"], default="TRACE",
                         help="Режим: TRACE (трассировка) или PERF (производительность)")
+    parser.add_argument("--trace-detail", choices=list(TRACE_DETAIL_CHOICES), default=TRACE_NORMAL,
+                        help="TRACE detail: full | normal | compact (default: normal).")
     parser.add_argument("--no-compact", action="store_true",
-                        help="Все события с полным префиксом (без объединения продолжений)")
+                        help="DEPRECATED alias for --trace-detail full")
     parser.add_argument("--no-context", action="store_true",
                         help="Не показывать контекст выполнения (C/S/C->S)")
     parser.add_argument("--no-expand-modules", action="store_true",
@@ -1856,6 +2227,16 @@ def main():
         print("Error: No file specified.")
         return
     out_name = args.output
+    trace_detail = args.trace_detail
+    if args.no_compact:
+        if args.trace_detail != TRACE_FULL:
+            print(
+                "Warning: --no-compact is deprecated and overrides --trace-detail to 'full'.",
+                file=sys.stderr,
+            )
+        trace_detail = TRACE_FULL
+    if args.mode != "TRACE" and args.trace_detail != TRACE_NORMAL:
+        print("Warning: --trace-detail is used only with --mode TRACE.", file=sys.stderr)
 
     report = process_pff(
         f_name,
@@ -1863,6 +2244,7 @@ def main():
         main_block=args.main_block,
         threshold_ms=args.threshold,
         mode=args.mode,
+        trace_detail=trace_detail,
         no_compact=args.no_compact,
         no_context=args.no_context,
         expand_module_names=not args.no_expand_modules,

@@ -18,7 +18,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 # Импорт из локального модуля (тот же каталог)
-from pff_parser import process_pff
+from pff_parser import process_pff, TRACE_FULL, TRACE_NORMAL, TRACE_COMPACT
 
 # Ссылки на виджеты для включения/выключения по режиму (заполняются в build_ui)
 _widgets_for_mode = None
@@ -43,13 +43,13 @@ def update_mode_sensitivity():
     if not w:
         return
     mode = w["var_mode"].get()
-    # TRACE: Порог недоступен. PERF: Умное сжатие недоступно.
+    # TRACE: порог недоступен, детализация TRACE доступна. PERF: наоборот.
     if mode == "TRACE":
         w["entry_threshold"].config(state=tk.DISABLED)
-        w["check_compact"].config(state=tk.NORMAL)
+        w["trace_detail_combo"].config(state="readonly")
     else:
         w["entry_threshold"].config(state=tk.NORMAL)
-        w["check_compact"].config(state=tk.DISABLED)
+        w["trace_detail_combo"].config(state=tk.DISABLED)
 
 
 def run_parser():
@@ -74,10 +74,8 @@ def run_parser():
             messagebox.showerror("Ошибка", "Порог должен быть числом (мс).")
             return
 
-    perf_only = mode == "PERF"
-    trace_only = mode == "TRACE"
     expand = var_expand_modules.get()
-    compact = var_compact.get() if mode == "TRACE" else False  # в PERF не используется
+    trace_detail = var_trace_detail.get() if mode == "TRACE" else TRACE_NORMAL
     include_model_prompt = var_include_model_prompt.get()
 
     try:
@@ -87,7 +85,8 @@ def run_parser():
             main_block=None,
             threshold_ms=threshold_ms,
             mode=mode,
-            no_compact=not compact,
+            trace_detail=trace_detail,
+            no_compact=False,
             no_context=False,
             expand_module_names=expand,
             include_model_prompt=include_model_prompt,
@@ -156,10 +155,11 @@ Count       — Количество выполнений.
 - Точка входа: Фильтр по подстроке кода (покажет только нужный сеанс).
 - Порог (мс): Минимальное время для включения в отчет (только PERF).
 - Разворачивать имена: Полные имена модулей или короткие (M1, M2).
-- Умное сжатие: Объединять переносы строк (только TRACE).
+- Детализация TRACE: full / normal / compact (только TRACE).
 - Промпт для модели: Инструкция для LLM в начале отчета.
 
 6. CLI (Командная строка)
+python pff_parser.py [file] --mode TRACE --trace-detail normal
 python pff_parser.py [file] --mode PERF --threshold 10
 """
 
@@ -194,7 +194,7 @@ def choose_file():
 
 
 def build_ui(root: tk.Tk):
-    global var_file, var_mode, var_entry, var_threshold, var_expand_modules, var_compact, var_include_model_prompt, result_text
+    global var_file, var_mode, var_entry, var_threshold, var_expand_modules, var_trace_detail, var_include_model_prompt, result_text
     global var_out_path, btn_copy, btn_open, _widgets_for_mode
 
     root.title("Парсер замеров производительности")
@@ -248,9 +248,18 @@ def build_ui(root: tk.Tk):
     check_expand = ttk.Checkbutton(main, text="Разворачивать имена модулей", variable=var_expand_modules)
     check_expand.grid(row=8, column=0, sticky=tk.W, pady=(0, 4))
     
-    var_compact = tk.BooleanVar(value=True)
-    check_compact = ttk.Checkbutton(main, text="Умное сжатие", variable=var_compact)
-    check_compact.grid(row=9, column=0, sticky=tk.W, pady=(0, 4))
+    detail_frame = ttk.Frame(main)
+    detail_frame.grid(row=9, column=0, sticky=tk.W, pady=(0, 4))
+    ttk.Label(detail_frame, text="Детализация TRACE:").pack(side=tk.LEFT, padx=(0, 6))
+    var_trace_detail = tk.StringVar(value=TRACE_NORMAL)
+    trace_detail_combo = ttk.Combobox(
+        detail_frame,
+        textvariable=var_trace_detail,
+        values=[TRACE_FULL, TRACE_NORMAL, TRACE_COMPACT],
+        state="readonly",
+        width=10,
+    )
+    trace_detail_combo.pack(side=tk.LEFT)
     
     var_include_model_prompt = tk.BooleanVar(value=True)
     check_model_prompt = ttk.Checkbutton(main, text="Включить промпт для модели в заголовок", variable=var_include_model_prompt)
@@ -259,7 +268,7 @@ def build_ui(root: tk.Tk):
     _widgets_for_mode = {
         "var_mode": var_mode,
         "entry_threshold": entry_threshold,
-        "check_compact": check_compact,
+        "trace_detail_combo": trace_detail_combo,
     }
     update_mode_sensitivity()
 
