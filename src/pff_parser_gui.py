@@ -65,12 +65,14 @@ def run_parser():
 
     mode = var_mode.get()
     entry = var_entry.get().strip() or None
-    try:
-        thresh_str = var_threshold.get().strip()
-        threshold_ms = float(thresh_str) if thresh_str else None
-    except ValueError:
-        messagebox.showerror("Ошибка", "Порог должен быть числом (мс).")
-        return
+    threshold_ms = None
+    if mode == "PERF":
+        try:
+            thresh_str = var_threshold.get().strip()
+            threshold_ms = float(thresh_str) if thresh_str else None
+        except ValueError:
+            messagebox.showerror("Ошибка", "Порог должен быть числом (мс).")
+            return
 
     perf_only = mode == "PERF"
     trace_only = mode == "TRACE"

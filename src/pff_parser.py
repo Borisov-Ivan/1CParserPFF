@@ -57,13 +57,12 @@ TRACE_MODEL_PROMPT = """=== ПРОМПТ ДЛЯ МОДЕЛИ (TRACE) ===
 
 Структура отчёта:
 - EXECUTION FLOW: хронологическое дерево вызовов (реконструировано эвристически, точность ~90%). Показывает что вызвало что, в порядке выполнения. Колбэк-цепочки (ВыполнитьОбработкуОповещения и т.п.) свёрнуты.
-- MODULES: справочник модулей с построчной детализацией. Тривиальные процедуры (Total < порога) свёрнуты, структурные строки (КонецЕсли и т.п.) убраны.
+- MODULES: справочник модулей с построчной детализацией.
 
 Правила:
 - В EXECUTION FLOW отступ = глубина вызова. Имя модуля — при смене. [Total] — включительное время. [Self: X] — чистое время на листьях (только если оно значимо).
 - ⤷ [колбэки ×N: ...] — свёрнутая цепочка асинхронных колбэков. Для анализа потока не существенна.
 - В MODULES формат строки: :Line | Code  Total  Pure (мс).
-- Пометка [свёрнуто] — процедура ниже порога, детали опущены.
 - Контекст: [C]=Клиент, [S]=Сервер, [C→S]=вызов сервера, [?]=неизвестно.
 
 Интерпретация:
@@ -933,7 +932,7 @@ class ExecutionFlowBuilder:
             else:
                 location = f":{e['Line']}"
 
-            code_snip = (e["Code"] or "").strip().replace("\n", " ")[:80]
+            code_snip = (e["Code"] or "").strip().replace("\n", " ")
 
             # Время:
             # - Листья с Pure > 10ms (или > threshold): [Self: Xms]
@@ -1291,7 +1290,7 @@ class ReportGenerator:
                 mod_name = _strip_extension_prefix(e["Module"], e.get("Extension"))
                 mod_short = _module_short_name(mod_name)
                 lines.append(f"#{idx} [{ctx}] {mod_short}:{e['Line']} | Budget: {item['budget']:.2f}ms")
-                lines.append(f"   {e['Code'].strip().replace(chr(10), ' ')[:180]}")
+                lines.append(f"   {(e.get('Code') or '').strip().replace(chr(10), ' ')}")
                 ref = item["reference"]
                 if ref:
                     g = ref["group"]
@@ -1354,8 +1353,6 @@ class ReportGenerator:
                 filtered_events = self._filter_block_events(b["events"])
                 collapsed = self._collapse_repeated_events(filtered_events)
 
-                trivial_count = len(b["events"]) - len(filtered_events)
-
                 for item in collapsed:
                     if item["type"] == "single":
                         e = item["event"]
@@ -1370,9 +1367,6 @@ class ReportGenerator:
                             f"    :{item['line_start']}-{item['line_end']} | "
                             f"{item['count']}× {item['pattern']}  Total: {item['total']:.2f}ms"
                         )
-
-                if trivial_count > 0:
-                    lines.append(f"    (+{trivial_count} тривиальных строк опущено)")
 
                 lines.append("")
 
@@ -1713,7 +1707,11 @@ def process_pff(file_path, entry=None, main_block=None,
         blocks_info = "1"
         entry_info = "все"
 
-    generator = ReportGenerator(events, session_info=session_info, threshold_ms=threshold_ms, all_events=all_evts, compact=not no_compact, show_context=not no_context, expand_module_names=expand_module_names)
+    effective_threshold_ms = threshold_ms
+    if mode == "TRACE":
+        effective_threshold_ms = 0.0
+
+    generator = ReportGenerator(events, session_info=session_info, threshold_ms=effective_threshold_ms, all_events=all_evts, compact=not no_compact, show_context=not no_context, expand_module_names=expand_module_names)
     return generator.get_full_report(
         entry_info=entry_info,
         blocks_info=blocks_info,
@@ -1732,7 +1730,7 @@ def main():
     parser.add_argument("--main-block", type=int, default=None,
                         help="Показать только блок N (0, 1, 2...). По умолчанию — все блоки")
     parser.add_argument("--threshold", type=float, default=None,
-                        help="Порог значимости (ms). По умолчанию: 1%% от max")
+                        help="Порог значимости (мс) для PERF. В TRACE игнорируется (порог=0).")
     parser.add_argument("--mode", choices=["TRACE", "PERF"], default="TRACE",
                         help="Режим: TRACE (трассировка) или PERF (производительность)")
     parser.add_argument("--no-compact", action="store_true",

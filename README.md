@@ -50,15 +50,15 @@ python src/pff_parser.py my_trace.pff
 python src/pff_parser.py my_trace.pff --mode PERF
 ```
 
-**Фильтрация по порогу времени (например, скрыть всё быстрее 10мс):**
+**Фильтрация по порогу времени (например, скрыть всё быстрее 10мс) — только PERF:**
 ```bash
-python src/pff_parser.py my_trace.pff --threshold 10
+python src/pff_parser.py my_trace.pff --mode PERF --threshold 10
 ```
 
 ### Опции
 
 *   `--mode {TRACE,PERF}`: Режим работы (по умолчанию `TRACE`).
-*   `--threshold N`: Порог значимости в миллисекундах (по умолчанию 1% от общего времени).
+*   `--threshold N`: Порог значимости в миллисекундах (только PERF; в TRACE порог=0).
 *   `--entry "Module:Line"`: Фильтрация по точке входа (показать только вызовы, проходящие через эту строку).
 *   `--main-block N`: Анализировать только указанный блок замера (сеанс).
 *   `--no-context`: Не показывать контекст выполнения (C/S).
