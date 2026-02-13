@@ -612,7 +612,7 @@ def _extract_called_module(code):
 
 
 class ProcedureGrouper:
-    """Группирует события в блоки [Ctx] Func/Proc (lines X-Y)."""
+    """Группирует события в блоки [Ctx] Func/Proc (:X-Y)."""
 
     def __init__(self, events):
         self.events = events
@@ -1299,7 +1299,7 @@ class ReportGenerator:
                     g_mod = _strip_extension_prefix(g["module"], g.get("extension"))
                     g_short = _module_short_name(g_mod)
                     lines.append(
-                        f"   -> see: {g_short} [{g_ctx}] {b['type']}(lines {b['line_start']}-{b['line_end']}) [Total: {b['total']:.2f}ms]"
+                        f"   -> see: {g_short} [{g_ctx}] {b['type']}(:{b['line_start']}-{b['line_end']}) [Total: {b['total']:.2f}ms]"
                     )
                 lines.append("")
 
@@ -1339,13 +1339,13 @@ class ReportGenerator:
                 # Правило 1: свёртка тривиальных процедур
                 if b["total"] < modules_threshold:
                     lines.append(
-                        f"  [{ctx}] {b['type']} (lines {b['line_start']}-{b['line_end']}) "
+                        f"  [{ctx}] {b['type']} (:{b['line_start']}-{b['line_end']}) "
                         f"Total: {b['total']:.2f}ms  [свёрнуто]"
                     )
                     continue
 
                 lines.append(
-                    f"  [{ctx}] {b['type']} (lines {b['line_start']}-{b['line_end']}) "
+                    f"  [{ctx}] {b['type']} (:{b['line_start']}-{b['line_end']}) "
                     f"Total: {b['total']:.2f}ms Pure: {b['pure']:.2f}ms"
                 )
 
