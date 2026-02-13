@@ -50,6 +50,15 @@ ISSUE_TYPE_PATTERNS = {
 }
 
 STRUCTURAL_NOISE = ["КонецЕсли", "КонецЦикла", "КонецПроцедуры", "КонецФункции"]
+CONTROL_FLOW_PREFIXES = (
+    "Если",
+    "Иначе",
+    "Для",
+    "Пока",
+    "Попытка",
+    "Исключение",
+)
+TERMINAL_FLOW_STATEMENTS = ("Возврат;", "Продолжить;", "Прервать;")
 
 # Промпты для модели в заголовке отчёта (при включённой опции на форме)
 TRACE_MODEL_PROMPT = """=== ПРОМПТ ДЛЯ МОДЕЛИ (TRACE) ===
@@ -611,6 +620,27 @@ def _extract_called_module(code):
     return None
 
 
+def _is_control_flow_line(code):
+    """Проверяет, является ли строка управляющей конструкцией (без привязки к модулю)."""
+    code_str = (code or "").strip()
+    if not code_str:
+        return False
+    for prefix in CONTROL_FLOW_PREFIXES:
+        if (code_str == prefix or code_str.startswith(prefix + " ")
+                or code_str.startswith(prefix + "(")):
+            return True
+    return False
+
+
+def _is_leaf_like_event(event, tolerance=0.15):
+    """Эвристика: событие почти не делегирует время во вложенные вызовы."""
+    total = float(event.get("Total", 0) or 0)
+    pure = float(event.get("Pure", 0) or 0)
+    if total <= 0:
+        return True
+    return abs(total - pure) <= max(0.001, total * tolerance)
+
+
 class ProcedureGrouper:
     """Группирует события в блоки [Ctx] Func/Proc (:X-Y)."""
 
@@ -816,6 +846,9 @@ class ExecutionFlowBuilder:
         for e in block["events"]:
             budget = e["Total"] - e["Pure"]
             is_cb = _is_callback(e)
+            code = e.get("Code") or ""
+            is_control = _is_control_flow_line(code)
+            has_called_module = _extract_called_module(code) is not None
 
             # Фильтрация: показываем только значимые события
             # - budget > threshold (есть значимые дочерние вызовы)
@@ -824,6 +857,13 @@ class ExecutionFlowBuilder:
             # - Total > threshold (значимое включительное время)
             if (budget <= self.threshold_ms and e["Pure"] <= self.threshold_ms
                     and e["Total"] <= self.threshold_ms and not is_cb):
+                continue
+
+            # Убираем управляющие строки (Если/Иначе/Циклы), если они не несут полезного сигнала:
+            # нет явного вызова модуля, нет колбэка, почти лист и время ниже "рабочего" порога.
+            control_threshold = max(1.0, self.threshold_ms)
+            if (is_control and not has_called_module and not is_cb
+                    and _is_leaf_like_event(e) and e["Total"] <= control_threshold):
                 continue
 
             node = {
@@ -1266,16 +1306,16 @@ class ReportGenerator:
         """TRACE v4: EXECUTION FLOW + CALL MAP + MODULES (оптимизированные)."""
         lines = []
         grouped = ProcedureGrouper(self.events).group()
-        call_map = CallMapBuilder(self.events, grouped, threshold_ms=self.threshold_ms).build()
-
-        # Вычислить порог для ExecutionFlowBuilder
-        ef_threshold = self._calc_modules_threshold()
+        trace_flow_threshold = self._calc_trace_flow_threshold()
+        trace_modules_threshold = self._calc_trace_modules_threshold(trace_flow_threshold)
+        call_map = CallMapBuilder(self.events, grouped, threshold_ms=trace_flow_threshold).build()
+        call_map, call_map_omitted = self._limit_call_map(call_map)
 
         lines.append("=== TRACE ===")
         lines.append("")
 
         # EXECUTION FLOW (v4) — перед CALL MAP
-        ef_builder = ExecutionFlowBuilder(self.events, grouped, ef_threshold)
+        ef_builder = ExecutionFlowBuilder(self.events, grouped, trace_flow_threshold)
         lines.append(ef_builder.build())
         lines.append("")
 
@@ -1302,11 +1342,14 @@ class ReportGenerator:
                         f"   -> see: {g_short} [{g_ctx}] {b['type']}(:{b['line_start']}-{b['line_end']}) [Total: {b['total']:.2f}ms]"
                     )
                 lines.append("")
+            if call_map_omitted > 0:
+                lines.append(f"... ещё {call_map_omitted} строк с меньшим Budget скрыто")
+                lines.append("")
 
         lines.append("=== MODULES (справочник модулей) ===")
 
         # Вычисляем порог для модулей (threshold для MODULES)
-        modules_threshold = self._calc_modules_threshold()
+        modules_threshold = trace_modules_threshold
 
         for g in grouped:
             # Правило 4: модули с суммой Total всех блоков < threshold — пропускаем
@@ -1350,7 +1393,7 @@ class ReportGenerator:
                 )
 
                 # Фильтрация и коллапс строк внутри блока
-                filtered_events = self._filter_block_events(b["events"])
+                filtered_events = self._filter_block_events(b["events"], modules_threshold)
                 collapsed = self._collapse_repeated_events(filtered_events)
 
                 for item in collapsed:
@@ -1522,6 +1565,57 @@ class ReportGenerator:
             lines.append(f"{indent}  [+ {hidden_count} мелких вызовов: {hidden_time:.2f} мс]")
         return last_mod, last_ext
 
+    def _calc_trace_flow_threshold(self):
+        """Адаптивный порог значимости для TRACE (без хардкода по модулям/именам)."""
+        if self.threshold_ms is not None:
+            return max(0.0, float(self.threshold_ms))
+
+        budgets = sorted(
+            (e["Total"] - e["Pure"] for e in self.events if (e["Total"] - e["Pure"]) > 0),
+            reverse=True
+        )
+        if not budgets:
+            return 0.5
+
+        total_ms = sum(e["Total"] for e in self.events)
+        base_threshold = max(0.5, total_ms * 0.0004)
+
+        # Держим плотность EXECUTION FLOW управляемой: срез по 150-му значимому budget.
+        target_rank = min(150, len(budgets))
+        rank_idx = target_rank - 1
+        rank_threshold = budgets[rank_idx]
+
+        return max(base_threshold, rank_threshold)
+
+    @staticmethod
+    def _calc_trace_modules_threshold(flow_threshold):
+        """Порог для MODULES в TRACE: мягче, чем для EXECUTION FLOW."""
+        return max(0.5, flow_threshold * 0.25)
+
+    def _limit_call_map(self, call_map):
+        """Ограничить длину CALL MAP по покрытию бюджета и максимальному размеру."""
+        if not call_map:
+            return call_map, 0
+
+        max_items = max(60, min(240, len(self.events) // 45))
+        min_items = min(60, max_items)
+        target_coverage = 0.90
+        total_budget = sum(item["budget"] for item in call_map)
+
+        selected = []
+        covered = 0.0
+        for item in call_map:
+            selected.append(item)
+            covered += item["budget"]
+            if len(selected) >= max_items:
+                break
+            if len(selected) >= min_items and total_budget > 0:
+                if covered / total_budget >= target_coverage:
+                    break
+
+        omitted = max(0, len(call_map) - len(selected))
+        return selected, omitted
+
     def _calc_modules_threshold(self):
         """Вычислить порог для MODULES: используем threshold_ms или 1% от общего времени."""
         if self.threshold_ms is not None:
@@ -1529,18 +1623,30 @@ class ReportGenerator:
         total_ms = sum(e["Total"] for e in self.events)
         return max(0.5, total_ms * 0.01)
 
-    @staticmethod
-    def _filter_block_events(events):
+    def _filter_block_events(self, events, modules_threshold=0.0):
         """Правило 2: фильтр строк — убрать структурный шум и тривиальные строки."""
         result = []
+        control_threshold = max(0.05, modules_threshold * 0.25)
         for e in events:
             code = (e.get("Code") or "").strip()
+
             # Убрать структурный шум
             if any(code.startswith(noise) for noise in STRUCTURAL_NOISE):
                 continue
+
+            # Убрать пустые управляющие переходы (без информативной нагрузки).
+            if code in TERMINAL_FLOW_STATEMENTS and e["Total"] <= max(0.1, modules_threshold):
+                continue
+
+            # Убрать дешёвые управляющие конструкции (Если/Иначе/Цикл), если они не вызывают модуль.
+            has_called_module = _extract_called_module(code) is not None
+            if (_is_control_flow_line(code) and not has_called_module
+                    and _is_leaf_like_event(e) and e["Total"] <= control_threshold):
+                continue
+
             # Убрать тривиальные строки: Total < 0.01 мс И Pure ≈ Total (разница < 10%)
             if e["Total"] < 0.01:
-                if e["Total"] == 0 or abs(e["Total"] - e["Pure"]) < e["Total"] * 0.1:
+                if e["Total"] == 0 or _is_leaf_like_event(e):
                     continue
             result.append(e)
         return result
@@ -1567,7 +1673,8 @@ class ReportGenerator:
             while j < len(events) and _code_pattern(events[j].get("Code")) == pat:
                 j += 1
             count = j - i
-            if count >= 5:
+            collapse_min_count = 4 if len(events) >= 40 else 5
+            if count >= collapse_min_count:
                 total = sum(e["Total"] for e in events[i:j])
                 result.append({
                     "type": "collapsed",
@@ -1709,7 +1816,7 @@ def process_pff(file_path, entry=None, main_block=None,
 
     effective_threshold_ms = threshold_ms
     if mode == "TRACE":
-        effective_threshold_ms = 0.0
+        effective_threshold_ms = None
 
     generator = ReportGenerator(events, session_info=session_info, threshold_ms=effective_threshold_ms, all_events=all_evts, compact=not no_compact, show_context=not no_context, expand_module_names=expand_module_names)
     return generator.get_full_report(
