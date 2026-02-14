@@ -160,6 +160,7 @@
   ('quopri', 'C:\\Python314\\Lib\\quopri.py', 'PYMODULE'),
   ('random', 'C:\\Python314\\Lib\\random.py', 'PYMODULE'),
   ('selectors', 'C:\\Python314\\Lib\\selectors.py', 'PYMODULE'),
+  ('shlex', 'C:\\Python314\\Lib\\shlex.py', 'PYMODULE'),
   ('shutil', 'C:\\Python314\\Lib\\shutil.py', 'PYMODULE'),
   ('signal', 'C:\\Python314\\Lib\\signal.py', 'PYMODULE'),
   ('socket', 'C:\\Python314\\Lib\\socket.py', 'PYMODULE'),
