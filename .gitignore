@@ -7,7 +7,6 @@ env/
 venv/
 .env
 .venv
-dist/
 *.egg-info/
 .DS_Store
 .vscode/
