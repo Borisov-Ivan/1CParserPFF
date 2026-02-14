@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['C:\\GitHub\\1CParserPFF\\src\\pff_parser_gui.py'],
+    ['..\\src\\pff_parser_gui.py'],
     pathex=[],
     binaries=[],
     datas=[],
