@@ -6,7 +6,7 @@
 - TRACE: полный хронологический лог (без сжатия, для reasoning/отладки)
 - PERF: дерево критического пути + Hotspots (с фильтрацией шума)
 
-Поддерживает: --entry, --main-block, --threshold, --no-perf, --perf-only, --no-hotspots, --no-compact, --no-context, --no-expand-modules
+Поддерживает: --threshold, --no-compact, --no-context, --no-expand-modules
 """
 
 import sys
@@ -108,11 +108,10 @@ PERF_MODEL_PROMPT = """=== ПРОМПТ ДЛЯ МОДЕЛИ (PERF) ===
 """
 
 
-TRACE_FORMAT_VERSION = "TRACE v6"
+TRACE_FORMAT_VERSION = "TRACE v7"
 TRACE_FULL = "full"
-TRACE_NORMAL = "normal"
 TRACE_COMPACT = "compact"
-TRACE_DETAIL_CHOICES = (TRACE_FULL, TRACE_NORMAL, TRACE_COMPACT)
+TRACE_DETAIL_CHOICES = (TRACE_FULL, TRACE_COMPACT)
 
 TRACE_DETAIL_PROFILES = {
     TRACE_FULL: {
@@ -129,21 +128,6 @@ TRACE_DETAIL_PROFILES = {
         "collapse_callback_min_chain": 999999,
         "leaf_self_highlight_min_ms": 5.0,
         "leaf_tiny_total_ms": 0.005,
-    },
-    TRACE_NORMAL: {
-        "flow_base_factor": 0.0004,
-        "flow_target_rank": 150,
-        "flow_floor_ms": 0.5,
-        "modules_ratio": 0.25,
-        "modules_floor_ms": 0.5,
-        "control_multiplier": 1.00,
-        "call_map_min_items": 60,
-        "call_map_max_items": 240,
-        "call_map_target_coverage": 0.90,
-        "collapse_repeat_min_count": 5,
-        "collapse_callback_min_chain": 3,
-        "leaf_self_highlight_min_ms": 10.0,
-        "leaf_tiny_total_ms": 0.010,
     },
     TRACE_COMPACT: {
         "flow_base_factor": 0.0009,
@@ -173,15 +157,21 @@ TRACE_COVERAGE_REASON_KEYS = (
 )
 
 
-def normalize_trace_detail(value):
-    """Normalize trace_detail to one of full/normal/compact."""
+def normalize_trace_detail(value, warn_if_normal=False):
+    """Normalize trace_detail to one of full/compact. 'normal' is deprecated alias."""
     if value is None:
-        return TRACE_NORMAL
+        return TRACE_COMPACT
     normalized = str(value).strip().lower()
+    if normalized == "normal":
+        if warn_if_normal:
+            print(
+                "Warning: trace_detail 'normal' is deprecated, using 'compact'.",
+                file=sys.stderr,
+            )
+        return TRACE_COMPACT
     if normalized not in TRACE_DETAIL_CHOICES:
         raise ValueError(
-            f"Unsupported trace detail '{value}'. "
-            f"Expected one of: {', '.join(TRACE_DETAIL_CHOICES)}."
+            f"Unsupported trace detail '{value}'. Expected one of: full, compact."
         )
     return normalized
 
@@ -194,17 +184,10 @@ def _coverage_counters():
     return {key: 0 for key in TRACE_COVERAGE_REASON_KEYS}
 
 
-def _repro_cli_command(file_path, mode, trace_detail, entry=None, main_block=None,
-                       expand_module_names=True, include_model_prompt=True):
+def _repro_cli_command(file_path, mode, trace_detail, include_model_prompt=True):
     cmd = ["python", "src/pff_parser.py", file_path, "--mode", mode]
     if mode == "TRACE":
         cmd.extend(["--trace-detail", normalize_trace_detail(trace_detail)])
-    if entry:
-        cmd.extend(["--entry", entry])
-    if main_block is not None:
-        cmd.extend(["--main-block", str(main_block)])
-    if not expand_module_names:
-        cmd.append("--no-expand-modules")
     if not include_model_prompt:
         cmd.append("--no-model-prompt")
     return " ".join(shlex.quote(str(part)) for part in cmd)
@@ -215,14 +198,17 @@ def build_trace_model_prompt(trace_detail):
     lines = [
         f"=== ПРОМПТ ДЛЯ МОДЕЛИ (TRACE {mode_label}) ===",
         f"Ты анализируешь отчёт {TRACE_FORMAT_VERSION} в режиме {mode_label}.",
-        "Обязательно ссылайся на EventID и Module:Line для каждого важного вывода.",
-        "Явно разделяй FACT (подтверждённые данные трассы) и INFERRED (эвристические связи).",
+        "Соглашения формата: #ID = FACT, ?ID = INFERRED, M01:Line = ссылка на модуль.",
+        "Сокращение MODULES MAP: 'ОМ.' = 'ОбщийМодуль.'.",
+        "Расшифровку M01/M02/... бери из секции MODULES MAP.",
+        "Контекст [C]/[S]/[C→S] берётся из данных замера, это не эвристика.",
+        "Обязательно ссылайся на EventID и Mxx:Line для каждого важного вывода.",
         "В TRACE запрещено делать выводы о производительности по времени как KPI; для этого нужен PERF.",
     ]
     if normalize_trace_detail(trace_detail) == TRACE_FULL:
-        lines.append("Для локализации сценария учитывай фильтр entry/main-block из TRACE META.")
+        lines.append("TRACE FULL используй для root-cause анализа, когда compact недостаточен.")
     else:
-        lines.append("Если данных не хватает, эскалируй анализ до TRACE FULL с тем же фильтром.")
+        lines.append("Если данных не хватает, эскалируй анализ до TRACE FULL.")
     lines.extend([
         "Используй TRACE COVERAGE, чтобы учитывать скрытые/свернутые элементы при выводах.",
         "=== КОНЕЦ ПРОМПТА ===",
@@ -647,37 +633,8 @@ class PFFStreamParser:
 
 
 # ==================================================================================================
-# 2. FILTERING (Entry Point, Main Block)
+# 2. SHARED HELPERS
 # ==================================================================================================
-
-def resolve_entry(events, entry_spec):
-    """Найти событие по entry_spec: 'Module:Line' или подстрока кода."""
-    if not entry_spec:
-        return None
-    # 1. Попробовать Module:Line
-    if ':' in entry_spec and not entry_spec.startswith('"'):
-        parts = entry_spec.rsplit(':', 1)
-        if len(parts) == 2:
-            mod, line_str = parts
-            try:
-                line = int(line_str)
-                for e in events:
-                    if e['Module'] == mod and e['Line'] == line:
-                        return e
-            except ValueError:
-                pass
-    # 2. Всегда fallback на поиск по подстроке кода
-    for e in events:
-        if entry_spec in e.get('Code', ''):
-            return e
-    return None
-
-
-def filter_by_main_block(events, main_block):
-    """Оставить только события из блока main_block (0, 1, 2...)."""
-    if main_block is None:
-        return events
-    return [e for e in events if e.get('block_id', 0) == main_block]
 
 
 def _strip_extension_prefix(module_name, extension):
@@ -705,9 +662,23 @@ def _event_sort_key(event):
     )
 
 
-def _event_ref(event):
-    event_id = event.get("_event_id", "E00000")
-    return f"{event_id} -> {event.get('Module', '?')}:{event.get('Line', '?')}"
+def _event_num(event):
+    raw = str(event.get("_event_id", "0"))
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return 0
+    return int(digits)
+
+
+def _compact_eid(event, default_type="fact"):
+    mark = "#" if default_type == "fact" else "?"
+    return f"{mark}{_event_num(event)}"
+
+
+def _abbrev_common_module(module_name):
+    if module_name.startswith("ОбщийМодуль."):
+        return "ОМ." + module_name[len("ОбщийМодуль."):]
+    return module_name
 
 
 def _is_callback(event):
@@ -944,11 +915,12 @@ class CallMapBuilder:
 class ExecutionFlowBuilder:
     """Build a heuristic execution tree for TRACE."""
 
-    def __init__(self, events, grouped_modules, threshold_ms, detail_profile=None):
+    def __init__(self, events, grouped_modules, threshold_ms, detail_profile=None, location_formatter=None):
         self.events = events
         self.grouped_modules = grouped_modules
         self.threshold_ms = threshold_ms
-        self.detail_profile = detail_profile or TRACE_DETAIL_PROFILES[TRACE_NORMAL]
+        self.detail_profile = detail_profile or TRACE_DETAIL_PROFILES[TRACE_COMPACT]
+        self.location_formatter = location_formatter
         self.block_index = self._build_block_index()
         self.used_blocks = set()
         self.shown_event_ids = set()
@@ -1092,12 +1064,12 @@ class ExecutionFlowBuilder:
                 forest.append({"group": entry["group"], "block": b, "nodes": subtree})
 
         lines = []
-        lines.append("=== EXECUTION FLOW (эвристическая реконструкция) ===")
-        lines.append("Связи восстановлены эвристически и помечены как INFERRED.")
+        lines.append("=== EXECUTION FLOW ===")
+        lines.append("Связи по умолчанию INFERRED (исключения помечены #).")
         lines.append("")
 
         for tree in forest:
-            self._format_tree_nodes(tree["nodes"], lines, indent=0, prev_module=None)
+            self._format_tree_nodes(tree["nodes"], lines, indent=0)
             lines.append("")
 
         return {
@@ -1106,7 +1078,7 @@ class ExecutionFlowBuilder:
             "hidden_reasons": dict(self.hidden_reasons),
         }
 
-    def _format_tree_nodes(self, nodes, lines, indent, prev_module):
+    def _format_tree_nodes(self, nodes, lines, indent):
         i = 0
         while i < len(nodes):
             node = nodes[i]
@@ -1120,70 +1092,42 @@ class ExecutionFlowBuilder:
                 collapse_min_chain = self.detail_profile.get("collapse_callback_min_chain", 3)
                 if len(cb_chain) >= collapse_min_chain:
                     first_event = cb_chain[0]["event"]
-                    first_event_id = first_event.get("_event_id", "E00000")
-                    last_event_id = cb_chain[-1]["event"].get("_event_id", first_event_id)
-                    self.shown_event_ids.add(first_event_id)
+                    first_id = _compact_eid(first_event, default_type="inferred")
+                    self.shown_event_ids.add(first_event.get("_event_id", "E00000"))
                     self.hidden_reasons["collapsed_callbacks"] += max(0, len(cb_chain) - 1)
 
                     parts = []
                     for cb in cb_chain:
                         e = cb["event"]
-                        parts.append(f"{cb['module_short']}:{e['Line']}")
+                        if self.location_formatter:
+                            parts.append(self.location_formatter(e["Module"], e["Line"], e.get("Extension")))
+                        else:
+                            parts.append(f"{cb['module_short']}:{e['Line']}")
 
                     prefix = "  " * indent
                     lines.append(
-                        f"{prefix}[INFERRED {first_event_id}..{last_event_id}] "
-                        f"[callbacks x{len(cb_chain)}: {' -> '.join(parts)}]"
+                        f"{prefix}{first_id} [callbacks x{len(cb_chain)}: {' -> '.join(parts)}]"
                     )
                     i = j
                     continue
 
             e = node["event"]
-            eid = e.get("_event_id", "E00000")
-            self.shown_event_ids.add(eid)
+            self.shown_event_ids.add(e.get("_event_id", "E00000"))
             ctx_label_str = context_label(node["context"]) or "?"
             prefix = "  " * indent
 
-            show_module = (prev_module != node["module_short"])
-            if show_module:
-                location = f"{node['module_short']}:{e['Line']}"
+            if self.location_formatter:
+                location = self.location_formatter(e["Module"], e["Line"], e.get("Extension"))
             else:
-                location = f":{e['Line']}"
+                location = f"{node['module_short']}:{e['Line']}"
 
             code_snip = (e["Code"] or "").strip().replace("\n", " ")
-            self_highlight_threshold = max(
-                self.threshold_ms,
-                self.detail_profile.get("leaf_self_highlight_min_ms", 10.0),
+            inferred_id = _compact_eid(e, default_type="inferred")
+            lines.append(
+                f"{prefix}{inferred_id} [{ctx_label_str}] {location} | {code_snip}"
             )
-
-            time_str = ""
-            if round(e["Total"]) > 0:
-                if node["children"]:
-                    if e["Pure"] > self_highlight_threshold:
-                        time_str = f"[{e['Total']:.0f}ms / {e['Pure']:.0f}ms]"
-                    else:
-                        time_str = f"[{e['Total']:.0f}ms]"
-                else:
-                    if e["Pure"] > self_highlight_threshold:
-                        time_str = f"[Self: {e['Pure']:.0f}ms]"
-                    else:
-                        time_str = f"[{e['Total']:.0f}ms]"
-
-            inferred_ref = _event_ref(e)
-            if show_module:
-                lines.append(
-                    f"{prefix}[INFERRED {inferred_ref}] [{ctx_label_str}] "
-                    f"{location} | {code_snip}  {time_str}".rstrip()
-                )
-            else:
-                lines.append(
-                    f"{prefix}[INFERRED {inferred_ref}] "
-                    f"{location} | {code_snip}  {time_str}".rstrip()
-                )
-
-            prev_module = node["module_short"]
             if node["children"]:
-                self._format_tree_nodes(node["children"], lines, indent + 1, prev_module)
+                self._format_tree_nodes(node["children"], lines, indent + 1)
 
             i += 1
 
@@ -1412,13 +1356,18 @@ CONTEXT_COL_WIDTH = 5  # "[C→S]" = 5 символов
 
 class ReportGenerator:
     def __init__(self, events, session_info=None, threshold_ms=None, all_events=None,
-                 trace_detail=TRACE_NORMAL, show_context=True, expand_module_names=True,
+                 trace_detail=TRACE_COMPACT, show_context=True, expand_module_names=True,
                  source_file_path=None, trace_request_meta=None, include_model_prompt=True):
         self.events = events
         self.session_info = session_info or {}
         self.all_events = all_events if all_events is not None else events
         self.modules_map = {}
         self.modules_list = []
+        self.trace_module_aliases = {}
+        self.trace_module_order = []
+        self.trace_module_titles = {}
+        self.trace_extension_aliases = {}
+        self.trace_extension_order = []
         self.threshold_ms = threshold_ms
         self.trace_detail = normalize_trace_detail(trace_detail)
         self.trace_profile = TRACE_DETAIL_PROFILES[self.trace_detail]
@@ -1454,10 +1403,19 @@ class ReportGenerator:
             self.modules_list.append(f"{mid} = {full_name}")
         return self.modules_map[full_name]
 
-    def generate_summary(self, entry_info, blocks_info):
-        """Секция СВОДКА. Общее время: при наличии _block_total_sec (формат 2b, время+процент) — по блокам;
-        иначе сумма по событиям уровня L0."""
-        # Формат 2b: общее время блока = time_sec * 100 / percent (одно значение на блок)
+    def _session_labels(self):
+        labels = []
+        seen = set()
+        for bid in sorted(self.session_info.keys()):
+            app_type = self.session_info.get(bid, {}).get("app_type")
+            label = SESSION_TYPES.get(app_type, f"Тип {app_type}") if app_type else None
+            if label and label not in seen:
+                labels.append(label)
+                seen.add(label)
+        return labels
+
+    def generate_summary(self):
+        """Краткая сводка без блоков/точки входа/хостнеймов."""
         by_block_sec = {}
         for e in self.events:
             if "_block_total_sec" in e:
@@ -1465,36 +1423,50 @@ class ReportGenerator:
                 if bid not in by_block_sec:
                     by_block_sec[bid] = e["_block_total_sec"]
         if by_block_sec:
-            total_time = sum(by_block_sec.values()) * 1000  # сек -> мс
+            total_time = sum(by_block_sec.values()) * 1000
         else:
             total_time = sum(e["Total"] for e in self.events if e["Level"] == 0)
-        main_branch_time = total_time
-        pct = 100 if total_time > 0 else 0
-
-        lines = []
-        lines.append("=== СВОДКА ===")
-        lines.append(f"События: {len(self.events)}")
-        lines.append(f"Вход: {entry_info}")
-        lines.append(f"Блоки: {blocks_info}")
-        lines.append(f"Общее время: {total_time/1000:.2f} с")
-        lines.append(f"Основная ветвь (L0): {main_branch_time/1000:.2f} с ({pct:.0f}%)")
+        sessions = ", ".join(self._session_labels()) or "н/д"
+        lines = [
+            "=== СВОДКА ===",
+            f"События: {len(self.events)} | Сессии: {sessions} | Время: {total_time/1000:.2f}с",
+        ]
         return "\n".join(lines)
 
-    def _format_location(self, module, line, extension=None):
-        """Форматирует местоположение: [Ext:Name] Module:Line"""
-        mod_name = module
-        if extension and module.startswith(extension + ' '):
-            mod_name = module[len(extension)+1:]
-            
-        mid = self.get_module_id(mod_name)
-        loc = f"{mid}:{line}" if mid else f":{line}"
-        
-        if extension:
-            return f"[Ext:{extension}] {loc}"
-        return loc
+    @staticmethod
+    def _trace_module_key(module, extension):
+        mod_wo_ext = _strip_extension_prefix(module, extension)
+        mod_abbrev = _abbrev_common_module(mod_wo_ext)
+        return (extension or "", mod_abbrev)
+
+    def _extension_alias(self, extension):
+        if not extension:
+            return None
+        if extension not in self.trace_extension_aliases:
+            alias = f"X{len(self.trace_extension_aliases) + 1}"
+            self.trace_extension_aliases[extension] = alias
+            self.trace_extension_order.append(extension)
+        return self.trace_extension_aliases[extension]
+
+    def _module_alias(self, module, extension):
+        key = self._trace_module_key(module, extension)
+        if key not in self.trace_module_aliases:
+            alias = f"M{len(self.trace_module_aliases) + 1:02d}"
+            self.trace_module_aliases[key] = alias
+            self.trace_module_order.append(key)
+            ext_alias = self._extension_alias(extension)
+            display_mod = key[1]
+            if ext_alias:
+                self.trace_module_titles[key] = f"[{ext_alias}] {display_mod}"
+            else:
+                self.trace_module_titles[key] = display_mod
+        return self.trace_module_aliases[key]
+
+    def _trace_location(self, module, line, extension):
+        return f"{self._module_alias(module, extension)}:{line}"
 
     def generate_trace(self):
-        """TRACE v6: META + COVERAGE + EXECUTION FLOW + CALL MAP + MODULES + REPRODUCE."""
+        """TRACE v7: META + COVERAGE + MODULES MAP + FLOW + CALL INDEX + MODULES + REPRODUCE."""
         lines = []
         grouped = ProcedureGrouper(self.events).group()
         trace_flow_threshold = self._calc_trace_flow_threshold()
@@ -1505,18 +1477,24 @@ class ReportGenerator:
         mode_label = trace_detail_label(self.trace_detail)
         lines.append(f"=== TRACE [{mode_label}] ===")
         lines.append("")
-        lines.extend(self._build_trace_meta_lines(trace_flow_threshold, trace_modules_threshold))
-        lines.append("")
 
-        # EXECUTION FLOW (v4) — перед CALL MAP
         ef_builder = ExecutionFlowBuilder(
             self.events,
             grouped,
             trace_flow_threshold,
             detail_profile=self.trace_profile,
+            location_formatter=self._trace_location,
         )
         ef_result = ef_builder.build()
-        modules_result = self._build_modules_section(grouped, trace_modules_threshold)
+        flow_shown_ids = set(ef_result.get("shown_event_ids", set()))
+        flow_modules = self._collect_flow_modules(flow_shown_ids)
+
+        modules_result = self._build_modules_section(
+            grouped,
+            trace_modules_threshold,
+            flow_modules=flow_modules if self.trace_detail == TRACE_COMPACT else None,
+        )
+        call_index_lines = self._build_call_index(call_map)
 
         coverage_reasons = self._merge_coverage(
             ef_result.get("hidden_reasons", {}),
@@ -1524,73 +1502,30 @@ class ReportGenerator:
         )
         coverage_reasons["threshold_hidden"] += call_map_omitted
         events_total = len(self.events)
-        flow_shown_ids = set(ef_result.get("shown_event_ids", set()))
         modules_shown_ids = set(modules_result.get("shown_event_ids", set()))
         self.trace_coverage = {
             "events_total": events_total,
             "events_shown": len(flow_shown_ids),
-            "events_hidden": max(0, events_total - len(flow_shown_ids)),
-            "call_map_total_entries": len(call_map_all),
-            "call_map_shown_entries": len(call_map),
-            "call_map_hidden_entries": max(0, len(call_map_all) - len(call_map)),
             "modules_total_events": events_total,
             "modules_shown_events": len(modules_shown_ids),
-            "modules_hidden_events": max(0, events_total - len(modules_shown_ids)),
             "reasons": coverage_reasons,
         }
-        shown_time_ms = sum(e["Total"] for e in self.events if e.get("_event_id") in flow_shown_ids)
-        total_time_ms = sum(e["Total"] for e in self.events)
-        call_map_budget_total = sum(item["budget"] for item in call_map_all)
-        call_map_budget_shown = sum(item["budget"] for item in call_map)
         self.trace_internal_metrics = {
-            "time_total_ms": total_time_ms,
-            "time_shown_ms": shown_time_ms,
-            "time_hidden_ms": max(0.0, total_time_ms - shown_time_ms),
-            "time_coverage_pct": (shown_time_ms * 100.0 / total_time_ms) if total_time_ms > 0 else 0.0,
-            "call_map_budget_total_ms": call_map_budget_total,
-            "call_map_budget_shown_ms": call_map_budget_shown,
-            "call_map_budget_coverage_pct": (
-                call_map_budget_shown * 100.0 / call_map_budget_total
-                if call_map_budget_total > 0 else 0.0
-            ),
+            "flow_threshold_ms": trace_flow_threshold,
+            "modules_threshold_ms": trace_modules_threshold,
         }
+
+        lines.extend(self._build_trace_meta_lines())
+        lines.append("")
         lines.extend(self._build_trace_coverage_lines())
         lines.append("")
-        lines.append(ef_result.get("text", ""))
+        lines.extend(self._build_modules_map_lines())
         lines.append("")
-
-        lines.append("=== CALL MAP ===")
-        lines.append("Budget = Total - Pure.")
-        if not call_map:
-            lines.append("Нет строк с заметным бюджетом вложенных вызовов.")
-        else:
-            for idx, item in enumerate(call_map, 1):
-                e = item["event"]
-                ctx = context_label(e.get("Context")) or "?"
-                mod_name = _strip_extension_prefix(e["Module"], e.get("Extension"))
-                mod_short = _module_short_name(mod_name)
-                lines.append(
-                    f"#{idx} [FACT {_event_ref(e)}] [{ctx}] {mod_short}:{e['Line']} "
-                    f"| Budget: {item['budget']:.2f}ms"
-                )
-                lines.append(f"   {(e.get('Code') or '').strip().replace(chr(10), ' ')}")
-                ref = item["reference"]
-                if ref:
-                    g = ref["group"]
-                    b = ref["block"]
-                    g_ctx = context_label(g.get("context")) or "?"
-                    g_mod = _strip_extension_prefix(g["module"], g.get("extension"))
-                    g_short = _module_short_name(g_mod)
-                    lines.append(
-                        f"   -> [INFERRED] see: {g_short} [{g_ctx}] "
-                        f"{b['type']}(:{b['line_start']}-{b['line_end']}) [Total: {b['total']:.2f}ms]"
-                    )
-                lines.append("")
-            if call_map_omitted > 0:
-                lines.append(f"... ещё {call_map_omitted} строк CALL MAP скрыто по порогу/бюджету")
-                lines.append("")
-
-        lines.append(modules_result.get("text", ""))
+        lines.append((ef_result.get("text", "") or "").rstrip())
+        lines.append("")
+        lines.extend(call_index_lines)
+        lines.append("")
+        lines.append((modules_result.get("text", "") or "").rstrip())
         lines.append("")
         lines.extend(self._build_trace_reproduce_lines())
         return "\n".join(lines)
@@ -1603,127 +1538,197 @@ class ReportGenerator:
                 merged[key] += int(counter.get(key, 0))
         return merged
 
-    def _build_trace_meta_lines(self, flow_threshold, modules_threshold):
-        lines = ["=== TRACE META ==="]
-        lines.append(f"trace_format: {TRACE_FORMAT_VERSION}")
-        lines.append("mode: TRACE")
-        lines.append(f"trace_detail: {self.trace_detail}")
-        lines.append(f"entry: {self.trace_request_meta.get('entry') or 'all'}")
-        mb = self.trace_request_meta.get("main_block")
-        lines.append(f"main_block: {mb if mb is not None else 'all'}")
-        lines.append(f"flow_threshold_ms: {flow_threshold:.4f}")
-        lines.append(f"modules_threshold_ms: {modules_threshold:.4f}")
-        lines.append(
-            "flags: "
-            f"show_context={self.show_context}, "
-            f"expand_module_names={self.expand_module_names}, "
-            f"collapse_repeats_min={self.trace_profile.get('collapse_repeat_min_count')}, "
-            f"collapse_callbacks_min={self.trace_profile.get('collapse_callback_min_chain')}"
-        )
+    def _collect_flow_modules(self, shown_event_ids):
+        flow_modules = set()
+        shown = set(shown_event_ids)
+        for e in self.events:
+            if e.get("_event_id") in shown:
+                flow_modules.add(self._trace_module_key(e["Module"], e.get("Extension")))
+        return flow_modules
+
+    def _build_modules_map_lines(self):
+        lines = ["=== MODULES MAP ==="]
+        for key in self.trace_module_order:
+            lines.append(f"{self.trace_module_aliases[key]}: {self.trace_module_titles[key]}")
+        for ext in self.trace_extension_order:
+            lines.append(f"{self.trace_extension_aliases[ext]}: {ext}")
+        if len(lines) == 1:
+            lines.append("(empty)")
         return lines
+
+    def _build_trace_meta_lines(self):
+        sessions = ", ".join(self._session_labels()) or "н/д"
+        return [
+            "=== TRACE META ===",
+            f"format: {TRACE_FORMAT_VERSION}",
+            f"detail: {self.trace_detail}",
+            f"sessions: {sessions}",
+        ]
 
     def _build_trace_coverage_lines(self):
         c = self.trace_coverage
         r = c.get("reasons", {})
         lines = ["=== TRACE COVERAGE ==="]
         lines.append(
-            f"events_total={c.get('events_total', 0)} "
-            f"events_shown={c.get('events_shown', 0)} "
-            f"events_hidden={c.get('events_hidden', 0)}"
+            f"events: {c.get('events_shown', 0)}/{c.get('events_total', 0)} | "
+            f"modules: {c.get('modules_shown_events', 0)}/{c.get('modules_total_events', 0)}"
         )
         lines.append(
-            f"call_map_total_entries={c.get('call_map_total_entries', 0)} "
-            f"call_map_shown_entries={c.get('call_map_shown_entries', 0)} "
-            f"call_map_hidden_entries={c.get('call_map_hidden_entries', 0)}"
+            "hidden: "
+            f"structural={int(r.get('structural_noise', 0))} "
+            f"control_leaf={int(r.get('control_leaf_noise', 0))} "
+            f"trivial={int(r.get('terminal_trivial', 0))} "
+            f"tiny={int(r.get('tiny_leaf', 0))} "
+            f"threshold={int(r.get('threshold_hidden', 0))}"
         )
-        lines.append(
-            f"modules_total_events={c.get('modules_total_events', 0)} "
-            f"modules_shown_events={c.get('modules_shown_events', 0)} "
-            f"modules_hidden_events={c.get('modules_hidden_events', 0)}"
-        )
-        for key in TRACE_COVERAGE_REASON_KEYS:
-            lines.append(f"{key}={int(r.get(key, 0))}")
         return lines
 
     def _build_trace_reproduce_lines(self):
         lines = ["=== TRACE REPRODUCE ==="]
         if not self.source_file_path:
-            lines.append("same_report: (source file path unavailable)")
-            lines.append("trace_full: (source file path unavailable)")
+            lines.append("same: (source file path unavailable)")
+            lines.append("full: (source file path unavailable)")
             return lines
 
-        meta = self.trace_request_meta
         same_cmd = _repro_cli_command(
             self.source_file_path,
             mode="TRACE",
             trace_detail=self.trace_detail,
-            entry=meta.get("entry"),
-            main_block=meta.get("main_block"),
-            expand_module_names=self.expand_module_names,
             include_model_prompt=self.include_model_prompt,
         )
         full_cmd = _repro_cli_command(
             self.source_file_path,
             mode="TRACE",
             trace_detail=TRACE_FULL,
-            entry=meta.get("entry"),
-            main_block=meta.get("main_block"),
-            expand_module_names=self.expand_module_names,
             include_model_prompt=self.include_model_prompt,
         )
-        lines.append(f"same_report: {same_cmd}")
-        lines.append(f"trace_full: {full_cmd}")
+        flow_threshold = float(self.trace_internal_metrics.get("flow_threshold_ms", 0.0))
+        modules_threshold = float(self.trace_internal_metrics.get("modules_threshold_ms", 0.0))
+        lines.append(f"same: {same_cmd}")
+        lines.append(f"full: {full_cmd}")
+        lines.append(
+            "params: "
+            f"flow_threshold_ms={flow_threshold:.2f} "
+            f"modules_threshold_ms={modules_threshold:.2f} "
+            f"collapse_repeats_min={int(self.trace_profile.get('collapse_repeat_min_count', 0))} "
+            f"collapse_callbacks_min={int(self.trace_profile.get('collapse_callback_min_chain', 0))}"
+        )
         return lines
 
-    def _build_modules_section(self, grouped, modules_threshold):
-        lines = ["=== MODULES (справочник модулей) ==="]
+    def _build_call_index(self, call_map):
+        lines = ["=== CALL INDEX ==="]
+        if not call_map:
+            lines.append("Нет ключевых узлов.")
+            return lines
+
+        by_event = {id(item["event"]): item for item in call_map}
+
+        def next_child(item):
+            ref = item.get("reference")
+            if not ref:
+                return None
+            block_events = ref["block"].get("events", [])
+            candidates = []
+            for e in block_events:
+                child = by_event.get(id(e))
+                if child and child is not item:
+                    candidates.append(child)
+            if not candidates:
+                return None
+            candidates.sort(key=lambda x: -float(x.get("budget", 0.0)))
+            return candidates[0]
+
+        main_chain = []
+        used_events = set()
+        cursor = call_map[0]
+        while cursor and len(main_chain) < 8:
+            eid = id(cursor["event"])
+            if eid in used_events:
+                break
+            used_events.add(eid)
+            main_chain.append(cursor["event"])
+            cursor = next_child(cursor)
+
+        if len(main_chain) < 2:
+            for item in call_map:
+                eid = id(item["event"])
+                if eid in used_events:
+                    continue
+                used_events.add(eid)
+                main_chain.append(item["event"])
+                if len(main_chain) >= min(6, len(call_map)):
+                    break
+
+        if main_chain:
+            chain = []
+            for e in main_chain:
+                chain.append(
+                    f"{_compact_eid(e, default_type='fact')} "
+                    f"{self._trace_location(e['Module'], e['Line'], e.get('Extension'))}"
+                )
+            lines.append(" → ".join(chain))
+
+        if self.trace_detail == TRACE_COMPACT:
+            return lines
+
+        for item in call_map:
+            e = item["event"]
+            if id(e) in used_events:
+                continue
+            ctx = context_label(e.get("Context")) or "?"
+            loc = self._trace_location(e["Module"], e["Line"], e.get("Extension"))
+            code = (e.get("Code") or "").strip().replace("\n", " ")
+            suffix = " (leaf)" if not item.get("reference") else ""
+            lines.append(f"{_compact_eid(e, default_type='fact')} [{ctx}] {loc} {code}{suffix}".rstrip())
+            used_events.add(id(e))
+            if len(lines) >= 10:
+                break
+        return lines
+
+    def _build_modules_section(self, grouped, modules_threshold, flow_modules=None):
+        lines = ["=== MODULES ==="]
         shown_event_ids = set()
         hidden_reasons = _coverage_counters()
 
         for g in grouped:
+            module_key = self._trace_module_key(g["module"], g.get("extension"))
+            if flow_modules is not None and module_key not in flow_modules:
+                continue
+
             module_events = sorted(g.get("events", []), key=_event_sort_key)
             module_total = sum(e.get("Total", 0) for e in module_events)
             if module_total < modules_threshold:
                 hidden_reasons["threshold_hidden"] += len(module_events)
-                continue
+                if self.trace_detail == TRACE_COMPACT:
+                    continue
 
             ctx = context_label(g.get("context")) or "?"
-            mod_name = _strip_extension_prefix(g["module"], g.get("extension"))
-            module_display = self.get_module_id(mod_name)
+            module_alias = self._module_alias(g["module"], g.get("extension"))
+            module_lines = []
+            module_lines.append("")
+            module_lines.append(f"--- [{ctx}] {module_alias} ---")
 
-            bid = g.get("block_id", 0)
-            si = self.session_info.get(bid, {})
-            app_type = si.get("app_type")
-            app_label = SESSION_TYPES.get(app_type, f"Тип {app_type}") if app_type else ""
-
-            header_parts = []
-            if app_label:
-                header_parts.append(f"B{bid} [{app_label}]")
-            if g.get("extension"):
-                header_parts.append(f"[Ext:{g['extension']}]")
-            header_parts.append(module_display)
-
-            lines.append("")
-            lines.append(f"--- {' '.join(header_parts)} ---")
-            lines.append("")
+            hidden_blocks = 0
 
             for b in g.get("blocks", []):
                 block_events = sorted(b.get("events", []), key=_event_sort_key)
                 if b["total"] < modules_threshold:
                     hidden_reasons["threshold_hidden"] += len(block_events)
-                    lines.append(
-                        f"  [{ctx}] {b['type']} (:{b['line_start']}-{b['line_end']}) "
-                        f"Total: {b['total']:.2f}ms  [свёрнуто по threshold]"
-                    )
+                    hidden_blocks += 1
                     continue
 
-                lines.append(
-                    f"  [{ctx}] {b['type']} (:{b['line_start']}-{b['line_end']}) "
-                    f"Total: {b['total']:.2f}ms Pure: {b['pure']:.2f}ms"
-                )
+                if self.trace_detail == TRACE_FULL:
+                    module_lines.append(
+                        f"{b['type']}(:{b['line_start']}-{b['line_end']}) Total: {b['total']:.0f}ms (ref)"
+                    )
+                else:
+                    module_lines.append(f"{b['type']}(:{b['line_start']}-{b['line_end']})")
 
                 filtered_events = self._filter_block_events(block_events, modules_threshold, hidden_reasons)
                 collapsed = self._collapse_repeated_events(filtered_events, hidden_reasons)
+                if not collapsed:
+                    hidden_blocks += 1
+                    continue
 
                 for item in collapsed:
                     if item["type"] == "single":
@@ -1732,21 +1737,27 @@ class ReportGenerator:
                         code_lines = (e["Code"] or "").replace("\r", "").split("\n")
                         if not code_lines:
                             code_lines = [""]
-                        lines.append(
-                            f"    [FACT {_event_ref(e)}] :{e['Line']} | "
-                            f"{code_lines[0]}  {e['Total']:.3f}  {e['Pure']:.3f}"
+                        module_lines.append(
+                            f"  {_compact_eid(e, default_type='fact')} :{e['Line']} | {code_lines[0]}"
                         )
                         for extra in code_lines[1:]:
-                            lines.append(f"           | {extra}")
+                            module_lines.append(f"    | {extra}")
                     elif item["type"] == "collapsed":
+                        first_num = int("".join(ch for ch in item["first_event_id"] if ch.isdigit()) or "0")
                         shown_event_ids.add(item["first_event_id"])
-                        lines.append(
-                            f"    [FACT {item['first_event_id']}..{item['last_event_id']}] "
-                            f":{item['line_start']}-{item['line_end']} | "
-                            f"{item['count']}x {item['pattern']}  Total: {item['total']:.2f}ms"
+                        module_lines.append(
+                            f"  #{first_num} :{item['line_start']}-{item['line_end']} | "
+                            f"{item['count']}x {item['pattern']}"
                         )
 
-                lines.append("")
+                module_lines.append("")
+
+            if hidden_blocks > 0 and self.trace_detail == TRACE_FULL:
+                module_lines.append(f"  [+ {hidden_blocks} функций, Total < {modules_threshold:.1f}ms]")
+
+            if self.trace_detail == TRACE_COMPACT and len(module_lines) <= 2:
+                continue
+            lines.extend(module_lines)
 
         return {
             "text": "\n".join(lines),
@@ -2063,23 +2074,15 @@ class ReportGenerator:
                 exts.add(ext)
         return sorted(exts)
 
-    def get_full_report(self, entry_info="all", blocks_info="", mode="TRACE", include_model_prompt=True):
+    def get_full_report(self, mode="TRACE", include_model_prompt=True):
         parts = []
-        self._ensure_modules()
         include_model_prompt = bool(include_model_prompt)
 
         # Header + Summary
         parts.append("=== ОТЧЁТ PFF ===")
         parts.append("")
-        parts.append(self.generate_summary(entry_info, blocks_info))
+        parts.append(self.generate_summary())
         parts.append("")
-
-        # Extensions
-        extensions = self._get_extensions()
-        if extensions:
-            parts.append("=== РАСШИРЕНИЯ ===")
-            parts.extend(extensions)
-            parts.append("")
 
         # Trace
         if mode == "TRACE":
@@ -2103,8 +2106,7 @@ class ReportGenerator:
 # 4. MAIN EXECUTION
 # ==================================================================================================
 
-def process_pff(file_path, entry=None, main_block=None,
-                threshold_ms=None, mode="TRACE", trace_detail=TRACE_NORMAL, no_compact=False,
+def process_pff(file_path, threshold_ms=None, mode="TRACE", trace_detail=TRACE_COMPACT, no_compact=False,
                 no_context=False, expand_module_names=True, include_model_prompt=True):
     if not os.path.exists(file_path):
         return "File not found."
@@ -2123,48 +2125,9 @@ def process_pff(file_path, entry=None, main_block=None,
     # builder = CallTreeBuilder(all_evts)
     # all_evts = builder.build()
 
-    num_blocks = len(set(e.get('block_id', 0) for e in all_evts))
     mode = (mode or "TRACE").upper()
     normalized_trace_detail = normalize_trace_detail(trace_detail)
-    trace_main_block = main_block
-
-    # Фильтрация: при entry — отбор блока, в который входит указанная строка; при main_block — только этот блок
-    if entry:
-        entry_event = resolve_entry(all_evts, entry)
-        if entry_event is not None:
-            bid = entry_event.get('block_id', 0)
-            trace_main_block = bid
-            events = filter_by_main_block(all_evts, bid)
-            entry_info = entry
-            blocks_info = f"Блок B{bid}, содержащий «{entry}» ({len(events)} соб.)"
-        else:
-            events = all_evts
-            entry_info = entry
-            blocks_info = f"{num_blocks} блоков, точка входа не найдена ({len(events)} соб.)"
-    elif main_block is not None:
-        events = filter_by_main_block(all_evts, main_block)
-        si = session_info.get(main_block, {})
-        app_type = si.get("app_type")
-        label = SESSION_TYPES.get(app_type, f"Тип {app_type}") if app_type else "?"
-        host = si.get("host", "")
-        blocks_info = f"{num_blocks} всего, B{main_block}: {len(events)} соб., {label} ({host})"
-        entry_info = f"блок {main_block}"
-    elif num_blocks > 1:
-        events = all_evts
-        parts = []
-        for bid in sorted(set(e.get('block_id', 0) for e in all_evts)):
-            n = sum(1 for x in all_evts if x.get('block_id') == bid)
-            si = session_info.get(bid, {})
-            app_type = si.get("app_type")
-            label = SESSION_TYPES.get(app_type, f"Тип {app_type}") if app_type else "?"
-            host = si.get("host", "")
-            parts.append(f"B{bid}: {n} соб., {label} ({host})")
-        blocks_info = " | ".join(parts)
-        entry_info = "все"
-    else:
-        events = all_evts
-        blocks_info = "1"
-        entry_info = "все"
+    events = all_evts
 
     effective_threshold_ms = threshold_ms
     if mode == "TRACE":
@@ -2172,10 +2135,6 @@ def process_pff(file_path, entry=None, main_block=None,
         if no_compact:
             normalized_trace_detail = TRACE_FULL
 
-    trace_request_meta = {
-        "entry": entry,
-        "main_block": trace_main_block,
-    }
     generator = ReportGenerator(
         events,
         session_info=session_info,
@@ -2185,15 +2144,21 @@ def process_pff(file_path, entry=None, main_block=None,
         show_context=not no_context,
         expand_module_names=expand_module_names,
         source_file_path=file_path,
-        trace_request_meta=trace_request_meta,
+        trace_request_meta={},
         include_model_prompt=include_model_prompt,
     )
-    return generator.get_full_report(
-        entry_info=entry_info,
-        blocks_info=blocks_info,
-        mode=mode,
-        include_model_prompt=include_model_prompt
-    )
+    return generator.get_full_report(mode=mode, include_model_prompt=include_model_prompt)
+
+
+def _default_output_path(file_path, mode, trace_detail=None):
+    base_dir = os.path.dirname(file_path)
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    if (mode or "").upper() == "TRACE":
+        detail = normalize_trace_detail(trace_detail)
+        suffix = f"_TRACE_{detail.upper()}"
+    else:
+        suffix = "_PERF"
+    return os.path.join(base_dir, f"{base_name}{suffix}.txt")
 
 
 def main():
@@ -2202,21 +2167,18 @@ def main():
     )
     parser.add_argument("file", nargs="?", help="Путь к PFF-файлу")
     parser.add_argument("output", nargs="?", help="Путь к отчёту (опционально)")
-    parser.add_argument("--entry", help="Точка входа: Module:Line или подстрока кода")
-    parser.add_argument("--main-block", type=int, default=None,
-                        help="Показать только блок N (0, 1, 2...). По умолчанию — все блоки")
     parser.add_argument("--threshold", type=float, default=None,
                         help="Порог значимости (мс) для PERF. В TRACE игнорируется (порог=0).")
     parser.add_argument("--mode", choices=["TRACE", "PERF"], default="TRACE",
                         help="Режим: TRACE (трассировка) или PERF (производительность)")
-    parser.add_argument("--trace-detail", choices=list(TRACE_DETAIL_CHOICES), default=TRACE_NORMAL,
-                        help="TRACE detail: full | normal | compact (default: normal).")
+    parser.add_argument("--trace-detail", default=None,
+                        help="TRACE detail: full | compact (default: compact).")
     parser.add_argument("--no-compact", action="store_true",
                         help="DEPRECATED alias for --trace-detail full")
     parser.add_argument("--no-context", action="store_true",
                         help="Не показывать контекст выполнения (C/S/C->S)")
     parser.add_argument("--no-expand-modules", action="store_true",
-                        help="Короткие имена модулей (M1, M2) и секция MODULES")
+                        help="DEPRECATED no-op (оставлено для обратной совместимости)")
     parser.add_argument("--no-model-prompt", action="store_true",
                         help="Не включать промпт для модели в заголовок отчёта")
 
@@ -2227,27 +2189,40 @@ def main():
         print("Error: No file specified.")
         return
     out_name = args.output
-    trace_detail = args.trace_detail
-    if args.no_compact:
-        if args.trace_detail != TRACE_FULL:
+    if args.mode == "TRACE":
+        try:
+            trace_detail = normalize_trace_detail(
+                args.trace_detail if args.trace_detail is not None else TRACE_COMPACT,
+                warn_if_normal=True,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return
+        if args.no_compact and trace_detail != TRACE_FULL:
             print(
                 "Warning: --no-compact is deprecated and overrides --trace-detail to 'full'.",
                 file=sys.stderr,
             )
-        trace_detail = TRACE_FULL
-    if args.mode != "TRACE" and args.trace_detail != TRACE_NORMAL:
-        print("Warning: --trace-detail is used only with --mode TRACE.", file=sys.stderr)
+            trace_detail = TRACE_FULL
+        elif args.no_compact:
+            trace_detail = TRACE_FULL
+    else:
+        trace_detail = TRACE_COMPACT
+        if args.trace_detail is not None:
+            print("Warning: --trace-detail is used only with --mode TRACE.", file=sys.stderr)
+        if args.no_compact:
+            print("Warning: --no-compact is used only with --mode TRACE.", file=sys.stderr)
+    if args.no_expand_modules:
+        print("Warning: --no-expand-modules is deprecated and ignored.", file=sys.stderr)
 
     report = process_pff(
         f_name,
-        entry=args.entry,
-        main_block=args.main_block,
         threshold_ms=args.threshold,
         mode=args.mode,
         trace_detail=trace_detail,
         no_compact=args.no_compact,
         no_context=args.no_context,
-        expand_module_names=not args.no_expand_modules,
+        expand_module_names=True,
         include_model_prompt=not args.no_model_prompt
     )
 
@@ -2256,8 +2231,7 @@ def main():
     except UnicodeEncodeError:
         sys.stdout.buffer.write((report + "\n").encode('utf-8'))
 
-    default_report_name = "PFF_Perf.txt" if args.mode == "PERF" else "PFF_Report.txt"
-    out_path = out_name or os.path.join(os.path.dirname(f_name), default_report_name)
+    out_path = out_name or _default_output_path(f_name, args.mode, trace_detail)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(report)
     print(f"\nОтчёт сохранён: {out_path}")

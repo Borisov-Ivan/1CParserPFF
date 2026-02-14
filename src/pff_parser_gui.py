@@ -18,16 +18,19 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 # Импорт из локального модуля (тот же каталог)
-from pff_parser import process_pff, TRACE_FULL, TRACE_NORMAL, TRACE_COMPACT
+from pff_parser import process_pff, TRACE_FULL, TRACE_COMPACT
 
 # Ссылки на виджеты для включения/выключения по режиму (заполняются в build_ui)
 _widgets_for_mode = None
 
 
-def get_save_path(file_path: str, mode: str) -> str:
-    """Путь сохранения по правилу 1С: каталог + имя_без_расширения + _TRACE|_PERF + .txt"""
+def get_save_path(file_path: str, mode: str, trace_detail=None) -> str:
+    """Имя выходного файла с учётом mode и trace_detail."""
     base = os.path.splitext(file_path)[0]
-    suffix = "_TRACE" if mode == "TRACE" else "_PERF"
+    if mode == "TRACE" and trace_detail:
+        suffix = f"_TRACE_{trace_detail.upper()}"
+    else:
+        suffix = "_PERF"
     return base + suffix + ".txt"
 
 
@@ -43,13 +46,17 @@ def update_mode_sensitivity():
     if not w:
         return
     mode = w["var_mode"].get()
-    # TRACE: порог недоступен, детализация TRACE доступна. PERF: наоборот.
+    # TRACE: порог скрыт, детализация доступна. PERF: порог показан, детализация отключена.
     if mode == "TRACE":
-        w["entry_threshold"].config(state=tk.DISABLED)
-        w["trace_detail_combo"].config(state="readonly")
+        w["threshold_label"].grid_remove()
+        w["entry_threshold"].grid_remove()
+        w["trace_radio_compact"].config(state=tk.NORMAL)
+        w["trace_radio_full"].config(state=tk.NORMAL)
     else:
-        w["entry_threshold"].config(state=tk.NORMAL)
-        w["trace_detail_combo"].config(state=tk.DISABLED)
+        w["threshold_label"].grid()
+        w["entry_threshold"].grid()
+        w["trace_radio_compact"].config(state=tk.DISABLED)
+        w["trace_radio_full"].config(state=tk.DISABLED)
 
 
 def run_parser():
@@ -64,7 +71,6 @@ def run_parser():
         return
 
     mode = var_mode.get()
-    entry = var_entry.get().strip() or None
     threshold_ms = None
     if mode == "PERF":
         try:
@@ -74,21 +80,18 @@ def run_parser():
             messagebox.showerror("Ошибка", "Порог должен быть числом (мс).")
             return
 
-    expand = var_expand_modules.get()
-    trace_detail = var_trace_detail.get() if mode == "TRACE" else TRACE_NORMAL
+    trace_detail = var_trace_detail.get() if mode == "TRACE" else TRACE_COMPACT
     include_model_prompt = var_include_model_prompt.get()
 
     try:
         report = process_pff(
             path,
-            entry=entry,
-            main_block=None,
             threshold_ms=threshold_ms,
             mode=mode,
             trace_detail=trace_detail,
             no_compact=False,
             no_context=False,
-            expand_module_names=expand,
+            expand_module_names=True,
             include_model_prompt=include_model_prompt,
         )
     except Exception as e:
@@ -102,7 +105,7 @@ def run_parser():
     # Вывод в текстовое поле
     fill_result_text(result_text, report)
 
-    out_path = get_save_path(path, mode)
+    out_path = get_save_path(path, mode, trace_detail if mode == "TRACE" else None)
     try:
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(report)
@@ -115,52 +118,61 @@ def run_parser():
     btn_open.config(state=tk.NORMAL)
 
 
-HELP_TEXT = """=== Руководство пользователя 1CParserPFF ===
+HELP_TEXT = """=== Руководство 1CParserPFF ===
 
-1. О ПРОГРАММЕ
-1CParserPFF — инструмент для анализа файлов замеров производительности 1С (.pff).
-Он преобразует сырые данные замера в структурированные текстовые отчеты, удобные для анализа разработчиком и LLM.
+1. НАЗНАЧЕНИЕ
+1CParserPFF анализирует файлы замеров производительности 1С (.pff)
+и формирует текстовые отчёты для разбора разработчиком или
+языковой моделью (LLM).
 
-2. БЫСТРЫЙ СТАРТ
-1. Запустите программу.
-2. Выберите файл замера (.pff или .txt).
-3. Выберите режим (TRACE или PERF).
-4. Нажмите «Сформировать».
-5. Результат появится в текстовом поле и сохранится в файл *_TRACE.txt / *_PERF.txt.
+2. ДВА ТИПА АНАЛИЗА
 
-3. ДВА РЕЖИМА РАБОТЫ
+  TRACE — «Что произошло?»
+  Восстанавливает цепочку вызовов: какой код выполнялся,
+  в каком порядке и с каким контекстом ([C] клиент, [S] сервер).
+  Используйте когда нужно понять логику выполнения,
+  найти причину ошибки, проверить какой код вызывался.
 
-[TRACE] — «Что произошло?»
-Восстановление потока выполнения и отладка логики.
-- EXECUTION FLOW: Дерево вызовов (эвристика ~90%). Колбэк-цепочки свернуты.
-- CALL MAP: Строки с наибольшим временем во вложенных вызовах (Budget).
-- MODULES: Справочник модулей. Тривиальные процедуры свернуты.
+  PERF — «Почему медленно?»
+  Находит узкие места по времени: TOP проблем, горячие строки.
+  Используйте когда нужно оптимизировать время выполнения.
 
-[PERF] — «Почему медленно?»
-Поиск узких мест и оптимизация.
-- TOP ISSUES: Топ проблем (HTTP, SQL, Логика) с цепочками вызовов.
-- HOTSPOTS: Топ строк по чистому времени (Self time).
-- Дерево критического пути (если есть Level).
+3. РЕЖИМЫ TRACE
 
-4. СЛОВАРЬ ТЕРМИНОВ
-Total (мс)  — Полное время строки (с вложенными).
-Pure (мс)   — Чистое время (только эта строка).
-Budget      — Total - Pure (время во вложенных).
-[C] / [S]   — Клиент / Сервер.
-[C->S]      — Вызов сервера с клиента.
-★           — Маркер узкого места (высокое Pure).
-Count       — Количество выполнений.
+  Обзор (compact) — режим по умолчанию.
+  Основная цепочка вызовов, только ключевые модули.
+  Достаточно для первого анализа.
+  Если информации не хватает — переключитесь на Подробный.
 
-5. НАСТРОЙКИ
-- Точка входа: Фильтр по подстроке кода (покажет только нужный сеанс).
-- Порог (мс): Минимальное время для включения в отчет (только PERF).
-- Разворачивать имена: Полные имена модулей или короткие (M1, M2).
-- Детализация TRACE: full / normal / compact (только TRACE).
-- Промпт для модели: Инструкция для LLM в начале отчета.
+  Подробный (full) — все модули, все события.
+  Для глубокого root-cause анализа когда Обзор недостаточен.
 
-6. CLI (Командная строка)
-python pff_parser.py [file] --mode TRACE --trace-detail normal
-python pff_parser.py [file] --mode PERF --threshold 10
+4. КАК РАБОТАТЬ
+  1. Откройте файл замера (.pff)
+  2. Нажмите «Сформировать» (по умолчанию — TRACE Обзор)
+  3. Изучите EXECUTION FLOW — это цепочка вызовов
+  4. Если нужны детали — переключите на «Подробный»
+     и сформируйте заново
+  5. Для анализа производительности — выберите PERF
+
+5. ЧТЕНИЕ ОТЧЁТА TRACE
+  MODULES MAP — расшифровка алиасов (M01, M02...)
+  EXECUTION FLOW — дерево вызовов
+    ? = эвристическая связь, # = подтверждённый факт
+  CALL INDEX — навигационная цепочка ключевых узлов
+  MODULES — детализация по модулям и процедурам
+  TRACE COVERAGE — что скрыто и почему
+  TRACE REPRODUCE — команда для повторного запуска
+
+6. ПАРАМЕТРЫ
+  Порог (мс) — минимальное время для включения
+    в отчёт (только для режима PERF)
+  Промпт для модели — блок инструкций для LLM
+    в начале отчёта (по умолчанию включён)
+
+7. ВЫХОДНОЙ ФАЙЛ
+  Результат сохраняется рядом с исходным файлом:
+    *_TRACE_COMPACT.txt / *_TRACE_FULL.txt / *_PERF.txt
 """
 
 
@@ -194,7 +206,7 @@ def choose_file():
 
 
 def build_ui(root: tk.Tk):
-    global var_file, var_mode, var_entry, var_threshold, var_expand_modules, var_trace_detail, var_include_model_prompt, result_text
+    global var_file, var_mode, var_threshold, var_trace_detail, var_include_model_prompt, result_text
     global var_out_path, btn_copy, btn_open, _widgets_for_mode
 
     root.title("Парсер замеров производительности")
@@ -206,8 +218,8 @@ def build_ui(root: tk.Tk):
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=1)
     main.columnconfigure(0, weight=1)
-    main.rowconfigure(12, weight=1)
-    main.rowconfigure(13, weight=0)
+    main.rowconfigure(10, weight=1)
+    main.rowconfigure(11, weight=0)
 
     # Файл
     ttk.Label(main, text="Путь к файлу:").grid(row=0, column=0, sticky=tk.W, pady=(0, 4))
@@ -231,50 +243,49 @@ def build_ui(root: tk.Tk):
     help_label.pack(side=tk.RIGHT, padx=(0, 0))
     help_label.bind("<Button-1>", lambda e: open_help())
 
-    # Точка входа
-    ttk.Label(main, text="Точка входа:").grid(row=4, column=0, sticky=tk.W, pady=(0, 4))
-    var_entry = tk.StringVar()
-    entry_entry = ttk.Entry(main, textvariable=var_entry, width=50)
-    entry_entry.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=(0, 8))
-
     # Порог (для PERF)
-    ttk.Label(main, text="Порог:").grid(row=6, column=0, sticky=tk.W, pady=(0, 4))
+    threshold_label = ttk.Label(main, text="Порог (мс):")
+    threshold_label.grid(row=4, column=0, sticky=tk.W, pady=(0, 4))
     var_threshold = tk.StringVar(value="0")
     entry_threshold = ttk.Entry(main, textvariable=var_threshold, width=12)
-    entry_threshold.grid(row=7, column=0, sticky=tk.W, pady=(0, 8))
+    entry_threshold.grid(row=5, column=0, sticky=tk.W, pady=(0, 8))
 
-    # Чекбоксы
-    var_expand_modules = tk.BooleanVar(value=True)
-    check_expand = ttk.Checkbutton(main, text="Разворачивать имена модулей", variable=var_expand_modules)
-    check_expand.grid(row=8, column=0, sticky=tk.W, pady=(0, 4))
-    
+    # Детализация TRACE
     detail_frame = ttk.Frame(main)
-    detail_frame.grid(row=9, column=0, sticky=tk.W, pady=(0, 4))
+    detail_frame.grid(row=6, column=0, sticky=tk.W, pady=(0, 4))
     ttk.Label(detail_frame, text="Детализация TRACE:").pack(side=tk.LEFT, padx=(0, 6))
-    var_trace_detail = tk.StringVar(value=TRACE_NORMAL)
-    trace_detail_combo = ttk.Combobox(
+    var_trace_detail = tk.StringVar(value=TRACE_COMPACT)
+    trace_radio_compact = ttk.Radiobutton(
         detail_frame,
-        textvariable=var_trace_detail,
-        values=[TRACE_FULL, TRACE_NORMAL, TRACE_COMPACT],
-        state="readonly",
-        width=10,
+        text="Обзор (compact)",
+        variable=var_trace_detail,
+        value=TRACE_COMPACT,
     )
-    trace_detail_combo.pack(side=tk.LEFT)
-    
+    trace_radio_compact.pack(side=tk.LEFT, padx=(0, 10))
+    trace_radio_full = ttk.Radiobutton(
+        detail_frame,
+        text="Подробный (full)",
+        variable=var_trace_detail,
+        value=TRACE_FULL,
+    )
+    trace_radio_full.pack(side=tk.LEFT)
+
     var_include_model_prompt = tk.BooleanVar(value=True)
     check_model_prompt = ttk.Checkbutton(main, text="Включить промпт для модели в заголовок", variable=var_include_model_prompt)
-    check_model_prompt.grid(row=10, column=0, sticky=tk.W, pady=(0, 8))
+    check_model_prompt.grid(row=7, column=0, sticky=tk.W, pady=(0, 8))
 
     _widgets_for_mode = {
         "var_mode": var_mode,
+        "threshold_label": threshold_label,
         "entry_threshold": entry_threshold,
-        "trace_detail_combo": trace_detail_combo,
+        "trace_radio_compact": trace_radio_compact,
+        "trace_radio_full": trace_radio_full,
     }
     update_mode_sensitivity()
 
     # Строка «Результат» + кнопка «Сформировать» справа (кнопка по умолчанию — Enter)
     result_header = ttk.Frame(main)
-    result_header.grid(row=11, column=0, sticky=(tk.W, tk.E), pady=(0, 4))
+    result_header.grid(row=8, column=0, sticky=(tk.W, tk.E), pady=(0, 4))
     result_header.columnconfigure(1, weight=1)
     ttk.Label(result_header, text="Результат:").grid(row=0, column=0, sticky=tk.W)
     
@@ -289,7 +300,7 @@ def build_ui(root: tk.Tk):
 
     # Текстовое поле результата
     table_frame = ttk.Frame(main)
-    table_frame.grid(row=12, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 0))
+    table_frame.grid(row=10, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 0))
     table_frame.columnconfigure(0, weight=1)
     table_frame.rowconfigure(0, weight=1)
 
@@ -306,7 +317,7 @@ def build_ui(root: tk.Tk):
     # Панель внизу: путь выходного файла, Копировать, Открыть
     var_out_path = tk.StringVar(value="")
     out_frame = ttk.Frame(main)
-    out_frame.grid(row=13, column=0, sticky=(tk.W, tk.E), pady=(8, 0))
+    out_frame.grid(row=11, column=0, sticky=(tk.W, tk.E), pady=(8, 0))
     out_frame.columnconfigure(1, weight=1)
     ttk.Label(out_frame, text="Выходной файл:").grid(row=0, column=0, sticky=tk.W, padx=(0, 6))
     entry_out = ttk.Entry(out_frame, textvariable=var_out_path, state=tk.DISABLED)

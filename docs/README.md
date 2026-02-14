@@ -1,75 +1,60 @@
-﻿# Документация 1CParserPFF
+# Документация 1CParserPFF
 
 ## 1. Назначение
 
-`1CParserPFF` преобразует `.pff` в человекочитаемые отчёты для анализа логики (`TRACE`) и производительности (`PERF`).
+`1CParserPFF` преобразует `.pff` в отчёты двух типов:
+
+- `TRACE` — сценарий выполнения (логика, причинно-следственные связи).
+- `PERF` — производительность (проблемы и горячие точки).
 
 ## 2. Быстрый старт
 
-### CLI
-
 ```bash
-python src/pff_parser.py tests/reference.pff
+python src/pff_parser.py tests/reference.pff --mode TRACE --trace-detail compact
 python src/pff_parser.py tests/reference.pff --mode TRACE --trace-detail full
 python src/pff_parser.py tests/reference.pff --mode PERF --threshold 10
 ```
 
-### GUI
+## 3. TRACE v7
 
-1. Выберите файл `.pff`.
-2. Выберите режим `TRACE` или `PERF`.
-3. Для `TRACE` выберите `Детализация TRACE` (`full/normal/compact`).
-4. Нажмите «Сформировать».
+### Детализация TRACE
 
-## 3. TRACE vs PERF
+- `compact` (по умолчанию)
+- `full`
 
-- `TRACE` — анализ поведения и причин.
-- `PERF` — анализ времени и узких мест.
+`normal` не используется и автоматически переводится в `compact` с предупреждением.
 
-Не используйте TRACE как замену PERF для оптимизации времени.
+### Порядок секций TRACE
 
-## 4. TRACE detail
-
-- `full`: минимальная фильтрация, максимум контекста.
-- `normal`: баланс сигнала/шума (default).
-- `compact`: агрессивное сжатие для сравнения прогонов.
-
-Legacy:
-
-- `--no-compact` поддерживается как deprecated alias для `--trace-detail full`.
-
-## 5. Формат TRACE v6
-
-Порядок секций:
-
-1. `=== TRACE [FULL|NORMAL|COMPACT] ===`
+1. `=== TRACE [FULL|COMPACT] ===`
 2. `=== TRACE META ===`
 3. `=== TRACE COVERAGE ===`
-4. `=== EXECUTION FLOW (эвристическая реконструкция) ===`
-5. `=== CALL MAP ===`
-6. `=== MODULES (справочник модулей) ===`
-7. `=== TRACE REPRODUCE ===`
+4. `=== MODULES MAP ===`
+5. `=== EXECUTION FLOW ===`
+6. `=== CALL INDEX ===`
+7. `=== MODULES ===`
+8. `=== TRACE REPRODUCE ===`
 
-## 6. Семантика данных
+### Формат ссылок
 
-- `EventID` сквозной для всех TRACE-секций.
-- `FACT` — подтверждённые данные трассы.
-- `INFERRED` — эвристические связи.
+- `#NNN` — факт
+- `?NNN` — эвристика
+- `MNN:Line` — ссылка на модуль через алиасы `MODULES MAP`
 
-## 7. CLI параметры
+## 4. CLI параметры
 
 - `--mode {TRACE,PERF}`
-- `--trace-detail {full,normal,compact}` (только TRACE)
+- `--trace-detail {full|compact}`
 - `--threshold N` (только PERF)
-- `--entry`, `--main-block`
-- `--no-context`, `--no-expand-modules`, `--no-model-prompt`
-- `--no-compact` (deprecated)
+- `--no-context`
+- `--no-model-prompt`
+- `--no-compact` — deprecated alias для `full`
+- `--no-expand-modules` — deprecated no-op
 
-## 8. Проверки
+## 5. Выходные файлы
 
-Минимальный набор:
+Если путь отчёта не указан, имя файла формируется автоматически:
 
-```bash
-python -m py_compile src/pff_parser.py
-python -m unittest discover -s tests -p "test_*.py"
-```
+- `*_TRACE_COMPACT.txt`
+- `*_TRACE_FULL.txt`
+- `*_PERF.txt`
