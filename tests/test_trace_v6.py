@@ -9,7 +9,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from pff_parser import process_pff, TRACE_FULL, TRACE_COMPACT
+from pff_parser import process_pff, TRACE_FULL, TRACE_COMPACT, build_trace_model_prompt
 
 REFERENCE_PFF = ROOT / "tests" / "reference.pff"
 SCRIPT_PATH = ROOT / "src" / "pff_parser.py"
@@ -98,6 +98,14 @@ class TraceV7Tests(unittest.TestCase):
 
         self.assertIn("format: TRACE v7", report)
         self.assertIn("detail: compact", report)
+
+    def test_trace_model_prompt_warns_about_incomplete_code_fragments(self):
+        expected = (
+            "Код в TRACE может быть неполным фрагментом; если данных строки недостаточно, "
+            "восстанавливай полный код по Mxx:Line в исходном модуле, просмотрев соседние строки."
+        )
+        self.assertIn(expected, build_trace_model_prompt(TRACE_FULL))
+        self.assertIn(expected, build_trace_model_prompt(TRACE_COMPACT))
 
     def test_compact_trace_has_no_threshold_stub_lines(self):
         compact = self.trace_reports[TRACE_COMPACT]
