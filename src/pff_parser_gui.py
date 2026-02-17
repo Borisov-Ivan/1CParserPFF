@@ -345,6 +345,13 @@ def build_ui(root: tk.Tk):
     btn_open = ttk.Button(out_frame, text="Открыть", command=open_out_path, state=tk.DISABLED)
     btn_open.grid(row=0, column=3)
 
+    # Подпись в правом нижнем углу без рамки
+    footer = ttk.Frame(main)
+    footer.grid(row=12, column=0, sticky=(tk.W, tk.E), pady=(4, 0))
+    footer.columnconfigure(0, weight=1)
+    copyright_label = ttk.Label(footer, text="(c) Борисов И.Г.", font=("", 9))
+    copyright_label.grid(row=0, column=1, sticky=tk.E)
+
 
 def main():
     root = tk.Tk()
